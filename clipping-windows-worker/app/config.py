@@ -84,6 +84,14 @@ class Settings(BaseSettings):
             return v
         return value
 
+    @field_validator("publish_state_dir", mode="before")
+    @classmethod
+    def _empty_publish_state_dir_is_default(cls, value: object) -> object:
+        # PUBLISH_STATE_DIR= (empty) must mean "default", not Path(".").
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("working_directory", mode="before")
     @classmethod
     def _expand_working_directory(cls, value: object) -> object:

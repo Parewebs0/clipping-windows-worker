@@ -63,3 +63,8 @@ def test_youtube_privacy_rejects_invalid(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("YOUTUBE_PRIVACY", "everyone")
     with pytest.raises(ValidationError):
         Settings(working_directory=str(tmp_path))
+
+
+def test_empty_publish_state_dir_means_default(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PUBLISH_STATE_DIR", "")
+    assert Settings(working_directory=str(tmp_path)).publish_state_dir is None
