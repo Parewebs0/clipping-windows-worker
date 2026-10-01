@@ -7,13 +7,16 @@ httpx>=0.27.0
 structlog>=24.1.0
 
 # Transcripción (GPU)
-# Adaptado a la API de whisperx 3.8+ (fork mantenido).
-# Instalar con soporte CUDA: pip install whisperx
 whisperx>=3.8.0
 
-# Descarga de vídeos (YouTube y otras fuentes con httpx no es viable:
-# YouTube devuelve HTML en /watch y requiere extractor específico).
+# Descarga de vídeos
 yt-dlp>=2026.8.0
+
+# YouTube publish (milestone 1)
+google-api-python-client>=2.140.0
+google-auth>=2.32.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
 
 # Tests
 pytest>=8.0.0
