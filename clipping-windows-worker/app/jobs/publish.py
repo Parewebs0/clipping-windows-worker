@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from app.jobs.base import BaseJob
+from app.services.publish_state import PublishStateStore
 from app.utils.clip_storage import ClipStorage, ClipStorageError
 
 
@@ -26,6 +27,14 @@ class PublishJob(BaseJob):
             raise ValueError("payload.campaign_id is required")
         if platform not in {"youtube", "instagram", "tiktok"}:
             raise NotImplementedError(f"platform {platform} not implemented")
+
+        if not dry_run:
+            # Idempotency: a previous attempt may have published already and then
+            # failed (e.g. reporting the result). Never upload the same clip twice.
+            store = PublishStateStore(self._publish_state_dir())
+            prior = store.get(str(clip_id), platform)
+            if prior is not None:
+                return self._reuse_prior(prior, clip_id=str(clip_id), campaign_id=campaign_id, file_path=file_path)
 
         dest = self._move_to_uploaded(clip_id=str(clip_id), campaign_id=campaign_id, file_path=file_path)
 
@@ -50,7 +59,7 @@ class PublishJob(BaseJob):
                 client_id=getattr(self.settings, "youtube_client_id", None) or "",
                 client_secret=getattr(self.settings, "youtube_client_secret", None) or "",
                 refresh_token=getattr(self.settings, "youtube_refresh_token", None) or "",
-                privacy=getattr(self.settings, "youtube_privacy", None) or "public",
+                privacy=getattr(self.settings, "youtube_privacy", None) or "private",
             )
             post_url = uploaded["post_url"]
             extra = {"video_id": uploaded.get("video_id")}
@@ -77,13 +86,58 @@ class PublishJob(BaseJob):
             post_url = uploaded["post_url"]
             extra = {"publish_id": uploaded.get("publish_id"), "privacy_level": uploaded.get("privacy_level")}
 
-        self.logger.info("published", clip_id=clip_id, platform=platform)
         pub = {"platform": platform, "status": "posted", "post_url": post_url}
         pub.update(extra)
+        # Persist BEFORE anything else can fail (reporting to the API happens later).
+        try:
+            store.record(str(clip_id), platform, pub, job_id=str(self.job.id), final_path_worker=str(dest))
+        except Exception as e:  # noqa: BLE001
+            # Do not fail the job here: failing would trigger a retry that
+            # re-publishes. The API result is then the only record.
+            self.logger.error(
+                "publish state NOT persisted (retry could duplicate)",
+                clip_id=clip_id, platform=platform, error=str(e),
+            )
+        self.logger.info("published", clip_id=clip_id, platform=platform, post_url=post_url)
         return {
             "dry_run": False,
             "source_moved": True,
             "final_path_worker": str(dest),
+            "publications": [pub],
+        }
+
+    def _publish_state_dir(self) -> Path:
+        configured = getattr(self.settings, "publish_state_dir", None)
+        if configured:
+            return Path(configured)
+        return Path(self.settings.working_directory) / "publish_state"
+
+    def _reuse_prior(
+        self,
+        prior: dict[str, Any],
+        *,
+        clip_id: str,
+        campaign_id: int | str,
+        file_path: str | None,
+    ) -> dict[str, Any]:
+        pub = dict(prior["publication"])
+        pub["status"] = "posted"
+        pub["reused_from_state"] = True
+        try:
+            dest = str(self._move_to_uploaded(clip_id=clip_id, campaign_id=campaign_id, file_path=file_path))
+        except (FileNotFoundError, ValueError):
+            dest = prior.get("final_path_worker") or ""
+        self.logger.warning(
+            "publish skipped: already published (reusing stored result)",
+            clip_id=clip_id,
+            platform=pub.get("platform"),
+            post_url=pub.get("post_url"),
+            first_job_id=prior.get("job_id"),
+        )
+        return {
+            "dry_run": False,
+            "source_moved": bool(dest),
+            "final_path_worker": dest,
             "publications": [pub],
         }
 

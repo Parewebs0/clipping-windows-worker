@@ -41,3 +41,30 @@ def test_ensure_directories_creates_all(tmp_path: Path) -> None:
 def test_working_directory_expands_user(tmp_path: Path) -> None:
     settings = Settings(working_directory=str(tmp_path))
     assert settings.working_directory == tmp_path
+
+
+def test_youtube_privacy_defaults_to_private(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("YOUTUBE_PRIVACY", raising=False)
+    settings = Settings(working_directory=str(tmp_path))
+    assert settings.youtube_privacy == "private"
+
+
+def test_youtube_privacy_from_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("YOUTUBE_PRIVACY", " Unlisted ")
+    assert Settings(working_directory=str(tmp_path)).youtube_privacy == "unlisted"
+    monkeypatch.setenv("YOUTUBE_PRIVACY", "")
+    assert Settings(working_directory=str(tmp_path)).youtube_privacy == "private"
+
+
+def test_youtube_privacy_rejects_invalid(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    monkeypatch.setenv("YOUTUBE_PRIVACY", "everyone")
+    with pytest.raises(ValidationError):
+        Settings(working_directory=str(tmp_path))
+
+
+def test_empty_publish_state_dir_means_default(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PUBLISH_STATE_DIR", "")
+    assert Settings(working_directory=str(tmp_path)).publish_state_dir is None

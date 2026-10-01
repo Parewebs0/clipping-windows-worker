@@ -23,7 +23,7 @@ def upload_short(
     client_id: str,
     client_secret: str,
     refresh_token: str,
-    privacy: str = "public",
+    privacy: str = "private",
 ) -> dict:
     if not file_path.exists():
         raise FileNotFoundError(str(file_path))
@@ -49,7 +49,7 @@ def upload_short(
             "categoryId": "22",
         },
         "status": {
-            "privacyStatus": privacy if privacy in {"public", "unlisted", "private"} else "public",
+            "privacyStatus": privacy if privacy in {"public", "unlisted", "private"} else "private",
             "selfDeclaredMadeForKids": False,
         },
     }
