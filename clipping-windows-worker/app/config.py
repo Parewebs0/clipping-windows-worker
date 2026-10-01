@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     instagram_ig_user_id: str | None = None
     tiktok_access_token: str | None = None
     tiktok_privacy: str = "SELF_ONLY"
+    # Where successful live publications are recorded (idempotency on retries).
+    # Default: <working_directory>/publish_state. Must survive restarts.
+    publish_state_dir: Path | None = None
 
     @property
     def downloads_dir(self) -> Path:
