@@ -91,6 +91,15 @@ copy .env.example .env
 | `AUTO_CLEANUP` | Limpieza automática | `true` |
 | `JOB_RETENTION_HOURS` | Retención de jobs completados | `24` |
 | `LOG_LEVEL` | Nivel de log | `INFO` |
+| `RENDER_OUTPUT_FPS` | FPS de salida del render | `30.0` |
+| `CLIP_STORAGE_ROOT` | Raíz del storage de clips por campaña | `C:\CODIANT\clipping\storage\clips` |
+| `FFMPEG_PATH` / `FFPROBE_PATH` | Rutas a los binarios (vacío = PATH) | — |
+| `GOG_PATH` / `GOG_ACCOUNT` / `GOG_KEYRING_PASSWORD` | gog CLI para descargas de Drive | — |
+| `PUBLISH_STATE_DIR` | Registro local de publicaciones reales (idempotencia en reintentos) | `<WORKING_DIRECTORY>\publish_state` |
+| `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` / `YOUTUBE_REFRESH_TOKEN` | OAuth de YouTube | — |
+| `YOUTUBE_PRIVACY` | `private` / `unlisted` / `public` | `private` |
+| `INSTAGRAM_ACCESS_TOKEN` / `INSTAGRAM_IG_USER_ID` | Graph API (Reels) | — |
+| `TIKTOK_ACCESS_TOKEN` / `TIKTOK_PRIVACY` | Content Posting API | — / `SELF_ONLY` |
 
 > **Seguridad:** nunca subas `.env` a Git. Usa `.env.example` como plantilla.
 
