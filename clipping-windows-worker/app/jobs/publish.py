@@ -59,7 +59,7 @@ class PublishJob(BaseJob):
                 client_id=getattr(self.settings, "youtube_client_id", None) or "",
                 client_secret=getattr(self.settings, "youtube_client_secret", None) or "",
                 refresh_token=getattr(self.settings, "youtube_refresh_token", None) or "",
-                privacy=getattr(self.settings, "youtube_privacy", None) or "public",
+                privacy=getattr(self.settings, "youtube_privacy", None) or "private",
             )
             post_url = uploaded["post_url"]
             extra = {"video_id": uploaded.get("video_id")}

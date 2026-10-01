@@ -41,7 +41,9 @@ class Settings(BaseSettings):
     youtube_client_id: str | None = None
     youtube_client_secret: str | None = None
     youtube_refresh_token: str | None = None
-    youtube_privacy: str = "public"
+    # private by default: a live upload never goes public by accident; flip to
+    # "unlisted"/"public" explicitly in .env once the account is trusted.
+    youtube_privacy: str = "private"
     instagram_access_token: str | None = None
     instagram_ig_user_id: str | None = None
     tiktok_access_token: str | None = None
@@ -69,6 +71,18 @@ class Settings(BaseSettings):
     @property
     def logs_dir(self) -> Path:
         return self.working_directory / "logs"
+
+    @field_validator("youtube_privacy", mode="before")
+    @classmethod
+    def _normalize_youtube_privacy(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return "private"
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v not in {"private", "unlisted", "public"}:
+                raise ValueError("YOUTUBE_PRIVACY must be private, unlisted or public")
+            return v
+        return value
 
     @field_validator("working_directory", mode="before")
     @classmethod
