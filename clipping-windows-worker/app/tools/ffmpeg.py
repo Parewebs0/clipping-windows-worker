@@ -146,13 +146,20 @@ class FFmpegTool:
                 int(watermark.get("margin_x", 40)),
                 int(watermark.get("margin_y", 40)),
             )
+            enable = ""
+            wm_start, wm_end = watermark.get("start"), watermark.get("end")
+            if wm_start is not None or wm_end is not None:
+                a = float(wm_start or 0.0)
+                b = float(wm_end) if wm_end is not None else duration
+                enable = f":enable='between(t,{a:.3f},{b:.3f})'"
             filter_complex = (
                 f"[0:v]{','.join(vf_parts)}[vmain];"
                 f"[1:v]scale={width}:-1[wm];"
-                f"[vmain][wm]overlay={x}:{y}[vout]"
+                f"[vmain][wm]overlay={x}:{y}{enable}[vout]"
             )
             command += ["-filter_complex", filter_complex]
-            command += ["-map", "[vout]", "-map", "0:a"]
+            # `0:a?`: no fallar si la fuente no tiene audio (el QA lo detecta).
+            command += ["-map", "[vout]", "-map", "0:a?"]
         else:
             # Sin watermark: simple filtergraph con -vf (1 entrada / 1 salida).
             command += ["-vf", ",".join(vf_parts)]
