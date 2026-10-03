@@ -90,20 +90,24 @@ def test_download_emits_canonical_and_alias_keys(tmp_path):
 
 
 def test_download_uses_job_id_in_filename(tmp_path):
-    """The filename must derive from job.id, not the URL."""
+    """Stable path is downloads/{job.id}/source.ext, never the URL.
+
+    Transcribe looks up the asset directory. The job id is the directory
+    when payload.asset_id is absent; the file name stays ``source``.
+    """
     settings = _make_settings(tmp_path)
     asset_dir = tmp_path / "asset"
     asset_dir.mkdir()
     _make_sample_mp4(asset_dir)
     httpd, base = _start_http_server(asset_dir)
     try:
-        job = _make_job("dl-job-id-abc-123", f"{base}/sample.mp4")
+        job = _make_job("dl-job-id-abc-123", f"{base}/sample.mp4?token=1&x=2")
         dj = DownloadJob(settings=settings, job=job)
         result = dj.execute()
-        # Filename should be the job id (with extension as-is from the server response)
-        assert Path(result["file_path"]).stem.startswith("dl-job-id-abc-123")
-        # Must NOT contain URL junk like "?", "&", "="
-        assert "?" not in Path(result["file_path"]).name
+        path = Path(result["file_path"])
+        assert path.parent.name == "dl-job-id-abc-123"
+        assert path.stem == "source"
+        assert "?" not in path.name and "&" not in path.name and "=" not in path.name
     finally:
         httpd.shutdown()
 
