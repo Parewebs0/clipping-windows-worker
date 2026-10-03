@@ -121,6 +121,9 @@ def test_render_full_spec_with_logo_url_and_captions(tmp_path):
     assert logo_y > bg_y + 20
     cap_y = _frame_mean(out, 1.0, "1080:200:0:1380")
     assert cap_y > bg_y + 1
+    fc = a["frame_checks"]
+    assert fc["logo_visible"] is True and fc["captions_visible"] is True
+    assert {s["what"] for s in fc["samples"]} >= {"logo", "captions", "background"}
 
 
 def test_render_without_audio_and_watermark_does_not_crash(tmp_path):
@@ -130,6 +133,18 @@ def test_render_without_audio_and_watermark_does_not_crash(tmp_path):
                         "watermark": {"enabled": True, "file": str(logo), "start": 0, "end": 1}})
     r = RenderJob(settings=_settings(tmp_path), job=job).execute()
     assert r["probe"]["has_audio"] is False and r["applied"]["watermark"]["applied"]
+
+
+def test_logo_request_sends_bearer_only_on_our_worker_route():
+    from app.jobs.render import logo_request
+
+    url, headers = logo_request("/worker/campaigns/3/logo", api_base_url="https://api.example", api_token="sek")
+    assert url == "https://api.example/worker/campaigns/3/logo"
+    assert headers == {"Authorization": "Bearer sek"}
+    _, external = logo_request("https://cdn.example/logo.png", api_base_url="https://api.example", api_token="sek")
+    assert external == {}
+    _, other = logo_request("https://evil.example/worker/campaigns/3/logo", api_base_url="https://api.example", api_token="sek")
+    assert other == {}
 
 
 def test_watermark_enabled_without_source_fails(tmp_path):
