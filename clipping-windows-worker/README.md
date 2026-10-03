@@ -207,6 +207,24 @@ No necesitas tocar el runner ni el worker loop.
 
 ---
 
+### Render: contrato `render_spec` v2 (issue #4)
+
+El VPS manda en el payload del job `render` (tiempos relativos al clip):
+
+```json
+{
+  "captions": {"enabled": true, "segments": [{"start": 0.0, "end": 2.1, "text": "...", "words": [{"start": 0.0, "end": 0.3, "word": "..."}]}],
+               "brand_dictionary": ["BOXABL"], "style": {"position": "bottom", "max_words": 4}},
+  "on_screen_text": {"enabled": true, "items": [{"text": "Link in bio", "start": 0, "end": 3, "position": "top"}]},
+  "watermark": {"enabled": true, "url": "https://.../logo.png", "position": "top_right", "width": 220, "start": 0, "end": null}
+}
+```
+
+- Subtítulos y texto en pantalla se generan en un único `.ass` (filtro `ass`, libass) desde la transcripción ya hecha; el diccionario de marca fija la ortografía.
+- El logo se descarga a `jobs/<id>/input/logo.*` (PNG/JPG/WebP; SVG no) y se superpone con `overlay` (ventana `start`/`end` opcional).
+- Compatibilidad: `captions.file` (.srt/.ass) y `watermark.file` siguen funcionando.
+- El resultado añade `applied{captions,on_screen_text,watermark}` y `probe{width,height,fps,has_audio,duration,codec}` para el verificador post-render del VPS.
+
 ## Estructura del proyecto
 
 ```

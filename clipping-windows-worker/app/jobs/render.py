@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from app.jobs.base import BaseJob
+from app.tools.captions import write_ass
 from app.tools.ffmpeg import FFmpegTool
+from app.tools.ffprobe import FFprobeTool
 
 
 class RenderJob(BaseJob):
@@ -35,16 +37,53 @@ class RenderJob(BaseJob):
         if not source.exists():
             raise FileNotFoundError(f"Input video not found: {source}")
 
-        # Subtítulos
+        # --- Contrato render_spec v2 (issue #4) ---------------------------
+        # captions{enabled, file | segments, brand_dictionary, style}
+        # watermark{enabled, file | url, position, width, start, end}
+        # on_screen_text{enabled, items[{text, start, end, position}]}
+        # Tiempos relativos al clip. `captions.file` / `watermark.file`
+        # (contrato antiguo) siguen funcionando.
+        duration = end - start
+        width, height = (1080, 1920) if output_format == "9:16" else (1920, 1080)
         captions = payload.get("captions") or {}
+        on_screen_text = payload.get("on_screen_text") or {}
+        applied: dict[str, Any] = {
+            "captions": {"applied": False, "events": 0},
+            "on_screen_text": {"applied": False, "texts": []},
+            "watermark": {"applied": False},
+        }
         captions_file = None
-        if captions.get("enabled") and captions.get("file"):
+        wants_generated = (captions.get("enabled") and captions.get("segments")) or on_screen_text.get("enabled")
+        if captions.get("enabled") and captions.get("file") and not captions.get("segments"):
             captions_file = self._resolve_input(captions["file"])
+            applied["captions"] = {"applied": True, "events": None, "file": str(captions_file)}
+            if on_screen_text.get("enabled"):
+                self.logger.warning("on_screen_text ignored: captions.file given (send segments instead)")
+        elif wants_generated:
+            ass_path = self.directory.output / "overlay.ass"
+            summary = write_ass(ass_path, width=width, height=height, captions=captions,
+                                on_screen_text=on_screen_text, duration=duration)
+            applied.update(summary)
+            if summary["captions"]["applied"] or summary["on_screen_text"]["applied"]:
+                captions_file = ass_path
 
-        # Watermark
-        watermark = payload.get("watermark") or {}
-        if watermark.get("enabled") and watermark.get("file"):
-            watermark = {**watermark, "file": str(self._resolve_input(watermark["file"]))}
+        # Watermark / logo
+        watermark = dict(payload.get("watermark") or {})
+        if watermark.get("enabled"):
+            if watermark.get("file"):
+                watermark["file"] = str(self._resolve_input(watermark["file"]))
+            elif watermark.get("url"):
+                watermark["file"] = str(self._download_logo(str(watermark["url"])))
+            else:
+                raise ValueError("watermark.enabled=true requires watermark.file or watermark.url")
+            applied["watermark"] = {
+                "applied": True,
+                "position": watermark.get("position", "top_right"),
+                "width": int(watermark.get("width", 180)),
+                "start": watermark.get("start"),
+                "end": watermark.get("end"),
+                "source": watermark.get("url") or Path(watermark["file"]).name,
+            }
 
         # Framerate de salida. Por defecto 30 fps para evitar que fuentes
         # nativos a 23.976/24/25/29.97 fallen la regla QA de ``min_fps``.
@@ -85,6 +124,7 @@ class RenderJob(BaseJob):
 
         self.logger.info("clip rendered", output=str(output_path))
         file_size = output_path.stat().st_size
+        probe = self._probe(output_path)
         # Duración real del clip generado (puede diferir ligeramente de
         # end-start por el redondeo a keyframe). La usamos en el QA y
         # la persistimos en VPS como `duration_seconds`.
@@ -100,7 +140,53 @@ class RenderJob(BaseJob):
             "filename": output_path.name,
             "size": file_size,
             "output_format": output_format,
+            # Issue #4: lo que se aplicó + medida real (verificador post-render del VPS)
+            "render_spec_version": 2,
+            "applied": applied,
+            "probe": probe,
         }
+
+    def _download_logo(self, url: str) -> Path:
+        """Descarga el logo a la carpeta del job (PNG/JPG/WebP)."""
+        import httpx
+
+        suffix = Path(url.split("?", 1)[0]).suffix.lower()
+        if suffix not in (".png", ".jpg", ".jpeg", ".webp"):
+            suffix = ".png"
+        dest = self.directory.input / f"logo{suffix}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with httpx.Client(follow_redirects=True, timeout=60) as client:
+            r = client.get(url)
+            r.raise_for_status()
+            ctype = r.headers.get("content-type", "")
+            if not ctype.startswith("image/") or "svg" in ctype:
+                raise ValueError(f"logo URL is not a raster image ({ctype or 'unknown'}): {url}")
+            dest.write_bytes(r.content)
+        return dest
+
+    def _probe(self, path: Path) -> dict[str, Any]:
+        try:
+            data = FFprobeTool(self.settings).probe(path)
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning("ffprobe failed", error=str(e))
+            return {}
+        out: dict[str, Any] = {"has_audio": False}
+        for st in data.get("streams", []):
+            if st.get("codec_type") == "video" and "width" not in out:
+                num, _, den = str(st.get("avg_frame_rate") or "0/1").partition("/")
+                try:
+                    fps = float(num) / float(den or 1)
+                except (ValueError, ZeroDivisionError):
+                    fps = 0.0
+                out.update({"width": st.get("width"), "height": st.get("height"), "fps": round(fps, 3),
+                            "codec": st.get("codec_name")})
+            elif st.get("codec_type") == "audio":
+                out["has_audio"] = True
+        try:
+            out["duration"] = round(float(data.get("format", {}).get("duration")), 3)
+        except (TypeError, ValueError):
+            pass
+        return out
 
     def _resolve_input(self, path: str) -> Path:
         """Resuelve una ruta de entrada, absoluta o relativa al job."""
