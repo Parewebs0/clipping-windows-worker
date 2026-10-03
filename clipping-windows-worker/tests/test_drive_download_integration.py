@@ -208,11 +208,17 @@ def test_download_recovers_from_virus_scan_page(tmp_path):
 
     # Primer stream: HTML (será rechazado por validate_media_file).
     html_stream = _stream_response(confirm_html.encode("utf-8"))
-    # Retry dentro de httpx.Client: binario real.
-    retry_resp = _httpx_response(status_code=200, content=binary)
+    # El probe del retry lee el HTML de confirmación; el GET con confirm=
+    # (dentro de try_with_confirm_token) devuelve el binario.
+    probe_resp = _httpx_response(status_code=200, text=confirm_html)
+    probe_resp.request = MagicMock()
+    probe_resp.request.url = "https://drive.google.com/uc?export=download&id=ABC"
+    binary_resp = _httpx_response(status_code=200, content=binary, text="")
 
+    # file_manager y drive_resolver comparten el módulo httpx: el primer
+    # Client.get es el probe HTML y el segundo es la descarga con confirm=.
     fake_client = MagicMock()
-    fake_client.get.return_value = retry_resp
+    fake_client.get.side_effect = [probe_resp, binary_resp]
     fake_client.__enter__ = lambda self: self
     fake_client.__exit__ = lambda self, *a: False
 

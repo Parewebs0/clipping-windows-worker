@@ -423,7 +423,7 @@ def _resolve_doc(
 
     # Buscar primer MP4/WebM directo en el HTML.
     direct = re.search(
-        r"https?://[^\"'<>\\s]+\.(?:mp4|webm|mov|m4v)",
+        r"https?://[^\"'<>\s]+\.(?:mp4|webm|mov|m4v)",
         html,
         re.IGNORECASE,
     )
