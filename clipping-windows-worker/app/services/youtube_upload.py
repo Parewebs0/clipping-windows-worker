@@ -24,6 +24,7 @@ def upload_short(
     client_secret: str,
     refresh_token: str,
     privacy: str = "private",
+    paid_promotion: bool = False,
 ) -> dict:
     if not file_path.exists():
         raise FileNotFoundError(str(file_path))
@@ -53,8 +54,14 @@ def upload_short(
             "selfDeclaredMadeForKids": False,
         },
     }
+    parts = "snippet,status"
+    if paid_promotion:
+        # Clipping campaigns are paid per view: declare paid promotion (YouTube
+        # Studio "includes paid promotion"). Supported by videos.insert.
+        body["paidProductPlacementDetails"] = {"hasPaidProductPlacement": True}
+        parts += ",paidProductPlacementDetails"
     media = MediaFileUpload(str(file_path), mimetype="video/mp4", resumable=True, chunksize=8 * 1024 * 1024)
-    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+    request = youtube.videos().insert(part=parts, body=body, media_body=media)
     response = None
     while response is None:
         _status, response = request.next_chunk()
