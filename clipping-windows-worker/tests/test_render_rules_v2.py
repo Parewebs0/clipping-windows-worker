@@ -11,9 +11,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.config import Settings
-from app.jobs.render import RenderJob
+from app.jobs.render import RENDER_SPEC_VERSION, RenderJob
 from app.models.job import Job
 from app.tools.captions import apply_brand_dictionary, build_ass, caption_events
+from app.tools.ffmpeg import loudnorm_filter, parse_loudnorm_json
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -57,6 +58,28 @@ def _frame_mean(video: Path, t: float, crop: str) -> float:
         if "YAVG=" in line:
             return float(line.split("YAVG=")[1])
     raise AssertionError(out.stderr)
+
+
+def _integrated_loudness(video: Path) -> tuple[float, float]:
+    """(integrated LUFS, true peak dBTP) of an already rendered file."""
+    out = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-i", str(video), "-vn",
+         "-af", "loudnorm=print_format=json", "-f", "null", "-"],
+        capture_output=True, text=True, check=True)
+    data = parse_loudnorm_json(out.stderr + out.stdout)
+    assert data, out.stderr
+    return float(data["input_i"]), float(data["input_tp"])
+
+
+def test_loudnorm_filter_targets():
+    assert loudnorm_filter() == "loudnorm=I=-14:TP=-1:LRA=11"
+    chain = loudnorm_filter({
+        "input_i": "-5.00", "input_tp": "-0.10", "input_lra": "0.50",
+        "input_thresh": "-15.00", "target_offset": "0.40",
+    })
+    assert chain.startswith("loudnorm=I=-14:TP=-1:LRA=11:")
+    assert "measured_I=-5.00" in chain and "linear=true" in chain
+    assert loudnorm_filter({"input_i": "-inf"}) == "loudnorm=I=-14:TP=-1:LRA=11"
 
 
 def test_brand_dictionary():
@@ -107,8 +130,11 @@ def test_render_full_spec_with_logo_url_and_captions(tmp_path):
         srv.shutdown()
     out = Path(r["file_path"])
     assert out.exists()
-    assert r["render_spec_version"] == 2
+    assert r["render_spec_version"] == RENDER_SPEC_VERSION == 3
     a = r["applied"]
+    assert a["audio"]["normalized"] is True
+    assert a["audio"]["filter"] == "loudnorm"
+    assert a["audio"]["target_lufs"] == -14 and a["audio"]["true_peak_db"] == -1
     assert a["captions"]["applied"] and a["captions"]["events"] >= 1 and "BOXABL" in a["captions"]["text"]
     assert a["on_screen_text"]["applied"] and a["on_screen_text"]["texts"][0]["text"] == "Tag @boxabl"
     assert a["watermark"]["applied"] and a["watermark"]["position"] == "top_right"
@@ -132,7 +158,10 @@ def test_render_without_audio_and_watermark_does_not_crash(tmp_path):
     job = _job("r-na", {"input_video": str(src), "format": "9:16", "start_time": 0, "end_time": 2,
                         "watermark": {"enabled": True, "file": str(logo), "start": 0, "end": 1}})
     r = RenderJob(settings=_settings(tmp_path), job=job).execute()
+    assert r["render_spec_version"] == 3
     assert r["probe"]["has_audio"] is False and r["applied"]["watermark"]["applied"]
+    assert r["applied"]["audio"]["normalized"] is False
+    assert r["applied"]["audio"]["reason"] == "no_audio"
 
 
 def test_logo_request_sends_bearer_only_on_our_worker_route():
@@ -145,6 +174,33 @@ def test_logo_request_sends_bearer_only_on_our_worker_route():
     assert external == {}
     _, other = logo_request("https://evil.example/worker/campaigns/3/logo", api_base_url="https://api.example", api_token="sek")
     assert other == {}
+
+
+def test_loudnorm_hits_publish_target_unless_original_only(tmp_path):
+    src = _src(tmp_path, audio=True, duration=6)
+    normalized = RenderJob(settings=_settings(tmp_path), job=_job("r-ln", {
+        "input_video": str(src), "format": "9:16", "start_time": 0, "end_time": 6,
+    })).execute()
+    kept = RenderJob(settings=_settings(tmp_path), job=_job("r-oo", {
+        "input_video": str(src), "format": "9:16", "start_time": 0, "end_time": 6,
+        "audio": {"original_only": True, "normalize": False, "target_lufs": -14, "true_peak_db": -1},
+    })).execute()
+    assert normalized["applied"]["audio"]["normalized"] is True
+    assert normalized["applied"]["audio"]["mode"] in {"linear", "single_pass"}
+    assert kept["applied"]["audio"] == {
+        "normalized": False,
+        "original_only": True,
+        "filter": None,
+        "target_lufs": -14,
+        "true_peak_db": -1,
+        "reason": "audio.original_only",
+    }
+    norm_i, norm_tp = _integrated_loudness(Path(normalized["file_path"]))
+    kept_i, _kept_tp = _integrated_loudness(Path(kept["file_path"]))
+    assert norm_i == pytest.approx(-14, abs=1.0)
+    assert norm_tp <= -0.5
+    # original_only re-encodes but does not pull the tone onto the -14 target
+    assert abs(kept_i - norm_i) > 5
 
 
 def test_watermark_enabled_without_source_fails(tmp_path):
