@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,11 @@ from app.utils.subprocess import run_command
 
 logger = get_logger("ffmpeg")
 
+# Publish loudness (MOLI-35). Skipped only when audio.original_only.
+LOUDNORM_TARGET_LUFS = -14
+LOUDNORM_TRUE_PEAK_DB = -1
+LOUDNORM_LRA = 11
+
 # Posiciones de watermark soportadas.
 WATERMARK_POSITIONS = {
     "top_left": "x=0:y=0",
@@ -19,6 +25,49 @@ WATERMARK_POSITIONS = {
     "bottom_right": "x=W-w:y=H-h",
     "center": "x=(W-w)/2:y=(H-h)/2",
 }
+
+
+def _finite_number(value: Any) -> str | None:
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if number != number or abs(number) == float("inf"):
+        return None
+    return f"{number:.2f}"
+
+
+def loudnorm_filter(measured: dict[str, Any] | None = None) -> str:
+    """Single-pass loudnorm, or a linear second pass when `measured` is usable."""
+    chain = f"loudnorm=I={LOUDNORM_TARGET_LUFS}:TP={LOUDNORM_TRUE_PEAK_DB}:LRA={LOUDNORM_LRA}"
+    if not measured:
+        return chain
+    fields = {
+        "measured_I": _finite_number(measured.get("input_i")),
+        "measured_TP": _finite_number(measured.get("input_tp")),
+        "measured_LRA": _finite_number(measured.get("input_lra")),
+        "measured_thresh": _finite_number(measured.get("input_thresh")),
+        "offset": _finite_number(measured.get("target_offset")),
+    }
+    if any(value is None for value in fields.values()):
+        return chain
+    measured_opts = ":".join(f"{key}={value}" for key, value in fields.items())
+    return f"{chain}:{measured_opts}:linear=true"
+
+
+def parse_loudnorm_json(stderr: str) -> dict[str, Any] | None:
+    marker = stderr.rfind('"input_i"')
+    if marker < 0:
+        return None
+    start = stderr.rfind("{", 0, marker)
+    end = stderr.find("}", marker)
+    if start < 0 or end < 0:
+        return None
+    try:
+        data = json.loads(stderr[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 class FFmpegTool:
@@ -65,6 +114,69 @@ class FFmpegTool:
         )
         return output
 
+    def prepare_loudnorm(
+        self,
+        input_path: str | Path,
+        *,
+        start: float,
+        duration: float,
+        original_only: bool,
+        has_audio: bool,
+    ) -> tuple[dict[str, Any], str | None]:
+        """Decide loudnorm for this clip. Returns `(applied.audio, filter or None)`.
+
+        `audio.original_only` leaves the track untouched. No audio stream means
+        there is nothing to normalize. Otherwise measure, then linear loudnorm
+        to -14 LUFS / -1 dBTP (single-pass if the measure is unusable).
+        """
+        meta: dict[str, Any] = {
+            "normalized": False,
+            "original_only": bool(original_only),
+            "filter": None,
+            "target_lufs": LOUDNORM_TARGET_LUFS,
+            "true_peak_db": LOUDNORM_TRUE_PEAK_DB,
+        }
+        if original_only:
+            meta["reason"] = "audio.original_only"
+            return meta, None
+        if not has_audio:
+            meta["reason"] = "no_audio"
+            return meta, None
+        measured = self._measure_loudnorm(input_path, start=start, duration=duration)
+        chain = loudnorm_filter(measured)
+        meta["normalized"] = True
+        meta["filter"] = "loudnorm"
+        meta["lra"] = LOUDNORM_LRA
+        meta["mode"] = "linear" if ":linear=true" in chain else "single_pass"
+        return meta, chain
+
+    def _measure_loudnorm(self, input_path: str | Path, *, start: float, duration: float) -> dict[str, Any] | None:
+        command = [
+            self._binary,
+            "-hide_banner",
+            "-ss",
+            f"{start:.3f}",
+            "-i",
+            str(input_path),
+            "-t",
+            f"{max(0.0, duration):.3f}",
+            "-vn",
+            "-af",
+            loudnorm_filter() + ":print_format=json",
+            "-f",
+            "null",
+            "-",
+        ]
+        try:
+            result = run_command(command, timeout=600)
+        except Exception as exc:  # noqa: BLE001 - unusable measure falls back to single-pass
+            logger.warning("loudnorm measure failed", error=str(exc))
+            return None
+        parsed = parse_loudnorm_json(result.stderr or "")
+        if parsed is None:
+            logger.warning("loudnorm measure returned no json")
+        return parsed
+
     def render_clip(
         self,
         *,
@@ -76,6 +188,7 @@ class FFmpegTool:
         captions_file: str | Path | None = None,
         watermark: dict[str, Any] | None = None,
         output_fps: float = 30.0,
+        audio_filter: str | None = None,
     ) -> Path:
         """Renderiza un clip: trim + crop/scale + subtítulos + watermark + encode.
 
@@ -152,17 +265,29 @@ class FFmpegTool:
                 a = float(wm_start or 0.0)
                 b = float(wm_end) if wm_end is not None else duration
                 enable = f":enable='between(t,{a:.3f},{b:.3f})'"
-            filter_complex = (
+            video_chain = (
                 f"[0:v]{','.join(vf_parts)}[vmain];"
                 f"[1:v]scale={width}:-1[wm];"
                 f"[vmain][wm]overlay={x}:{y}{enable}[vout]"
             )
-            command += ["-filter_complex", filter_complex]
-            # `0:a?`: no fallar si la fuente no tiene audio (el QA lo detecta).
-            command += ["-map", "[vout]", "-map", "0:a?"]
+            if audio_filter:
+                command += [
+                    "-filter_complex",
+                    f"{video_chain};[0:a]{audio_filter}[aout]",
+                    "-map",
+                    "[vout]",
+                    "-map",
+                    "[aout]",
+                ]
+            else:
+                command += ["-filter_complex", video_chain]
+                # `0:a?`: no fallar si la fuente no tiene audio (el QA lo detecta).
+                command += ["-map", "[vout]", "-map", "0:a?"]
         else:
             # Sin watermark: simple filtergraph con -vf (1 entrada / 1 salida).
             command += ["-vf", ",".join(vf_parts)]
+            if audio_filter:
+                command += ["-af", audio_filter]
 
         # Forzar framerate de salida. Se coloca DESPUÉS del filtergraph
         # para que se aplique al stream codificado (no al input). Esto
@@ -197,6 +322,7 @@ class FFmpegTool:
             end=end,
             format=output_format,
             watermark=has_watermark,
+            loudnorm=bool(audio_filter),
             output_fps=output_fps,
         )
         run_command(command, timeout=3600, cwd=vfilter_cwd)

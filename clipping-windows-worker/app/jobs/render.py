@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 
 from app.jobs.base import BaseJob
 
+RENDER_SPEC_VERSION = 3
+
 
 def logo_request(url: str, *, api_base_url: str, api_token: str) -> tuple[str, dict[str, str]]:
     """Join a relative worker path and attach the token only for our /worker/ routes.
@@ -51,12 +53,14 @@ class RenderJob(BaseJob):
         if not source.exists():
             raise FileNotFoundError(f"Input video not found: {source}")
 
-        # --- Contrato render_spec v2 (issue #4) ---------------------------
+        # --- Contrato render_spec v3 (v2 + loudnorm) -----------------------
         # captions{enabled, file | segments, brand_dictionary, style}
         # watermark{enabled, file | url, position, width, start, end}
         # on_screen_text{enabled, items[{text, start, end, position}]}
+        # audio{original_only, normalize, target_lufs, true_peak_db}
         # Tiempos relativos al clip. `captions.file` / `watermark.file`
-        # (contrato antiguo) siguen funcionando.
+        # (contrato antiguo) siguen funcionando. `audio.original_only`
+        # deja la pista sin loudnorm.
         duration = end - start
         width, height = (1080, 1920) if output_format == "9:16" else (1920, 1080)
         captions = payload.get("captions") or {}
@@ -116,6 +120,17 @@ class RenderJob(BaseJob):
         clip_filename = f"{candidate_id}.mp4" if candidate_id else "clip.mp4"
         output_path = self.directory.output / clip_filename
         ffmpeg = FFmpegTool(self.settings)
+        audio_payload = payload.get("audio") if isinstance(payload.get("audio"), dict) else {}
+        original_only = bool(audio_payload.get("original_only"))
+        has_audio = FFprobeTool(self.settings).get_audio_stream(source) is not None
+        audio_meta, audio_filter = ffmpeg.prepare_loudnorm(
+            source,
+            start=start,
+            duration=duration,
+            original_only=original_only,
+            has_audio=has_audio,
+        )
+        applied["audio"] = audio_meta
 
         self.logger.info(
             "rendering clip",
@@ -134,6 +149,7 @@ class RenderJob(BaseJob):
             captions_file=captions_file,
             watermark=watermark,
             output_fps=output_fps,
+            audio_filter=audio_filter,
         )
 
         self.logger.info("clip rendered", output=str(output_path))
@@ -155,8 +171,8 @@ class RenderJob(BaseJob):
             "filename": output_path.name,
             "size": file_size,
             "output_format": output_format,
-            # Issue #4: lo que se aplicó + medida real (verificador post-render del VPS)
-            "render_spec_version": 2,
+            # v3: applied.audio (loudnorm) + probe. v2 sigue siendo válido en el VPS.
+            "render_spec_version": RENDER_SPEC_VERSION,
             "applied": applied,
             "probe": probe,
         }
