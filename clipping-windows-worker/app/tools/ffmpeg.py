@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import Settings
+from app.tools.reframe import square_center_filters
 from app.utils.logging import get_logger
 from app.utils.subprocess import run_command
 
@@ -189,10 +190,19 @@ class FFmpegTool:
         watermark: dict[str, Any] | None = None,
         output_fps: float = 30.0,
         audio_filter: str | None = None,
+        video_filters: list[str] | None = None,
+        video_complex: str | None = None,
+        filter_cwd: str | None = None,
     ) -> Path:
         """Renderiza un clip: trim + crop/scale + subtítulos + watermark + encode.
 
-        ``output_format`` soporta "9:16" (1080x1920) y "16:9" (1920x1080).
+        ``output_format`` soporta "9:16" (1080x1920), "16:9" (1920x1080) y "1:1"
+        (1080x1080).
+
+        ``video_filters`` sustituye solo el crop/scale/pad (reframe de una ventana).
+        ``video_complex`` es un filter_complex que ya termina en ``[vmain]``
+        (split, screenshare, fit). Con los dos a None el crop de 9:16 y 16:9
+        es el histórico.
 
         ``output_fps`` fuerza el framerate de salida (default 30.0) para que el
         QA no falle por fuentes nativos a 23.976/24/25/29.97. El ajuste se
@@ -206,8 +216,15 @@ class FFmpegTool:
         duration = max(0.0, end - start)
 
         # --- Filtros de vídeo (crop/scale) ---
+        # 9:16 y 16:9 sin reframe: mismas cadenas de siempre. No reordenar.
         vf_parts: list[str] = []
-        if output_format == "9:16":
+        complex_body: str | None = None
+        label = "[vmain]"
+        if video_complex:
+            complex_body = video_complex
+        elif video_filters is not None:
+            vf_parts.extend(video_filters)
+        elif output_format == "9:16":
             vf_parts.append("crop=ih*9/16:ih")
             vf_parts.append("scale=1080:1920:force_original_aspect_ratio=decrease")
             vf_parts.append("pad=1080:1920:(ow-iw)/2:(oh-ih)/2")
@@ -215,6 +232,8 @@ class FFmpegTool:
             vf_parts.append("crop=iw:iw*9/16")
             vf_parts.append("scale=1920:1080:force_original_aspect_ratio=decrease")
             vf_parts.append("pad=1920:1080:(ow-iw)/2:(oh-ih)/2")
+        elif output_format == "1:1":
+            vf_parts.extend(square_center_filters())
         else:
             raise ValueError(f"Unsupported output_format: {output_format}")
 
@@ -222,11 +241,17 @@ class FFmpegTool:
         # Los filtros de FFmpeg (subtitles/ass) no aceptan rutas Windows con
         # drive colon (`C:\...`). Por ello se referencia el archivo por nombre
         # relativo y el proceso arranca con cwd en su carpeta.
-        vfilter_cwd: str | None = None
+        vfilter_cwd: str | None = filter_cwd
         if captions_file:
             cf = Path(captions_file)
-            vf_parts.append(self._subtitle_filter(cf.name))
-            vfilter_cwd = str(cf.parent)
+            subtitle = self._subtitle_filter(cf.name)
+            if complex_body is not None:
+                complex_body = f"{complex_body};{label}{subtitle}[vcapped]"
+                label = "[vcapped]"
+            else:
+                vf_parts.append(subtitle)
+            if vfilter_cwd is None:
+                vfilter_cwd = str(cf.parent)
 
         # --- Construcción del comando ---
         # Nota: `-t` se coloca DESPUÉS de todos los inputs para que se aplique
@@ -265,11 +290,18 @@ class FFmpegTool:
                 a = float(wm_start or 0.0)
                 b = float(wm_end) if wm_end is not None else duration
                 enable = f":enable='between(t,{a:.3f},{b:.3f})'"
-            video_chain = (
-                f"[0:v]{','.join(vf_parts)}[vmain];"
-                f"[1:v]scale={width}:-1[wm];"
-                f"[vmain][wm]overlay={x}:{y}{enable}[vout]"
-            )
+            if complex_body is not None:
+                video_chain = (
+                    f"{complex_body};"
+                    f"[1:v]scale={width}:-1[wm];"
+                    f"{label}[wm]overlay={x}:{y}{enable}[vout]"
+                )
+            else:
+                video_chain = (
+                    f"[0:v]{','.join(vf_parts)}[vmain];"
+                    f"[1:v]scale={width}:-1[wm];"
+                    f"[vmain][wm]overlay={x}:{y}{enable}[vout]"
+                )
             if audio_filter:
                 command += [
                     "-filter_complex",
@@ -283,6 +315,18 @@ class FFmpegTool:
                 command += ["-filter_complex", video_chain]
                 # `0:a?`: no fallar si la fuente no tiene audio (el QA lo detecta).
                 command += ["-map", "[vout]", "-map", "0:a?"]
+        elif complex_body is not None:
+            if audio_filter:
+                command += [
+                    "-filter_complex",
+                    f"{complex_body};[0:a]{audio_filter}[aout]",
+                    "-map",
+                    label,
+                    "-map",
+                    "[aout]",
+                ]
+            else:
+                command += ["-filter_complex", complex_body, "-map", label, "-map", "0:a?"]
         else:
             # Sin watermark: simple filtergraph con -vf (1 entrada / 1 salida).
             command += ["-vf", ",".join(vf_parts)]

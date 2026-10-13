@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -25,6 +26,7 @@ def logo_request(url: str, *, api_base_url: str, api_token: str) -> tuple[str, d
 from app.tools.captions import write_ass
 from app.tools.ffmpeg import FFmpegTool
 from app.tools.ffprobe import FFprobeTool
+from app.tools.reframe import needs_source_size, output_size, plan_reframe
 
 
 class RenderJob(BaseJob):
@@ -58,11 +60,13 @@ class RenderJob(BaseJob):
         # watermark{enabled, file | url, position, width, start, end}
         # on_screen_text{enabled, items[{text, start, end, position}]}
         # audio{original_only, normalize, target_lufs, true_peak_db}
+        # reframe{mode, layout, smoothing, sample_fps, speakers}
+        #   mode=center + layout=single (o ausente) = crop centrado histórico.
         # Tiempos relativos al clip. `captions.file` / `watermark.file`
         # (contrato antiguo) siguen funcionando. `audio.original_only`
         # deja la pista sin loudnorm.
         duration = end - start
-        width, height = (1080, 1920) if output_format == "9:16" else (1920, 1080)
+        width, height = output_size(output_format)
         captions = payload.get("captions") or {}
         on_screen_text = payload.get("on_screen_text") or {}
         applied: dict[str, Any] = {
@@ -132,6 +136,47 @@ class RenderJob(BaseJob):
         )
         applied["audio"] = audio_meta
 
+        reframe_cfg = payload.get("reframe") if isinstance(payload.get("reframe"), dict) else {}
+        if not reframe_cfg.get("speakers"):
+            reframe_cfg = dict(reframe_cfg)
+            speakers = []
+            for seg in captions.get("segments") or []:
+                if not isinstance(seg, dict) or not seg.get("speaker"):
+                    continue
+                try:
+                    speakers.append({
+                        "start": float(seg.get("start") or 0),
+                        "end": float(seg.get("end") or 0),
+                        "speaker": str(seg["speaker"]),
+                    })
+                except (TypeError, ValueError):
+                    continue
+            if speakers:
+                reframe_cfg["speakers"] = speakers
+        work_dir = captions_file.parent if captions_file else self.directory.output
+        src_w, src_h = (0, 0)
+        if needs_source_size(reframe_cfg, output_format):
+            resolution = FFprobeTool(self.settings).get_resolution(source)
+            if resolution:
+                src_w, src_h = resolution
+        t_plan = time.perf_counter()
+        plan = plan_reframe(
+            input_path=source,
+            start=start,
+            end=end,
+            output_format=output_format,
+            reframe=reframe_cfg,
+            src_w=src_w,
+            src_h=src_h,
+            output_fps=output_fps,
+            work_dir=work_dir,
+            ffmpeg_bin=self.settings.ffmpeg_path or "ffmpeg",
+            model_dir=Path(self.settings.working_directory) / "models",
+        )
+        plan.metadata.setdefault("timings", {})
+        plan.metadata["timings"]["plan_s"] = round(time.perf_counter() - t_plan, 3)
+        applied["reframe"] = plan.metadata
+
         self.logger.info(
             "rendering clip",
             input=str(source),
@@ -139,7 +184,10 @@ class RenderJob(BaseJob):
             end=end,
             format=output_format,
             output_fps=output_fps,
+            reframe=plan.metadata.get("mode"),
+            reframe_layout=plan.metadata.get("layout"),
         )
+        t_render = time.perf_counter()
         ffmpeg.render_clip(
             input_path=source,
             output_path=output_path,
@@ -150,7 +198,11 @@ class RenderJob(BaseJob):
             watermark=watermark,
             output_fps=output_fps,
             audio_filter=audio_filter,
+            video_filters=plan.vf,
+            video_complex=plan.complex_graph,
+            filter_cwd=str(work_dir) if plan.command_files else None,
         )
+        plan.metadata["timings"]["render_s"] = round(time.perf_counter() - t_render, 3)
 
         self.logger.info("clip rendered", output=str(output_path))
         file_size = output_path.stat().st_size
