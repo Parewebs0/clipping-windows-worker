@@ -94,17 +94,35 @@ def caption_events(segments: list[dict[str, Any]], *, max_words: int = 4, durati
 _POS_ALIGN = {"bottom": 2, "center": 5, "middle": 5, "top": 8}
 
 
+def _ass_colour(value: Any, default: str) -> str:
+    """Validate an ASS &HAABBGGRR colour; fall back to `default` when malformed."""
+    s = str(value or "").strip()
+    if re.fullmatch(r"&H[0-9A-Fa-f]{6,8}(&)?", s):
+        return s.rstrip("&")
+    return default
+
+
 def build_ass(*, width: int, height: int, captions: dict[str, Any] | None, on_screen_text: dict[str, Any] | None,
-              duration: float) -> tuple[str, dict[str, Any]]:
-    """Devuelve (contenido .ass, resumen de lo aplicado)."""
+              duration: float, branding: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
+    """Devuelve (contenido .ass, resumen de lo aplicado).
+
+    `branding` (MOLI-54) sustituye fuente y colores cuando llega:
+    font_name (familia, debe coincidir con la fuente en fontsdir),
+    caption_color / outline_color en formato ASS &HAABBGGRR.
+    Cualquier campo ausente mantiene el estilo por defecto (Arial).
+    """
     cap = captions or {}
     ost = on_screen_text or {}
+    br = branding or {}
     style = cap.get("style") or {}
-    font = style.get("font", "Arial")
+    font = br.get("font_name") or style.get("font", "Arial")
     size = int(style.get("size", round(height * 0.038)))
     cap_align = _POS_ALIGN.get(style.get("position", "bottom"), 2)
     cap_margin_v = int(style.get("margin_v", round(height * 0.22)))
+    primary = _ass_colour(br.get("caption_color"), "&H00FFFFFF")
+    outline_c = _ass_colour(br.get("outline_color"), "&H00000000")
     ost_size = int((ost.get("style") or {}).get("size", round(height * 0.034)))
+    ost_font = str(br.get("font_name") or style.get("font", "Arial"))
     header = (
         "[Script Info]\nScriptType: v4.00+\n"
         f"PlayResX: {width}\nPlayResY: {height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n"
@@ -112,9 +130,9 @@ def build_ass(*, width: int, height: int, captions: dict[str, Any] | None, on_sc
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
         "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
         "MarginR, MarginV, Encoding\n"
-        f"Style: Caption,{font},{size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,6,2,"
+        f"Style: Caption,{font},{size},{primary},{primary},{outline_c},&H64000000,-1,0,0,0,100,100,0,0,1,6,2,"
         f"{cap_align},60,60,{cap_margin_v},1\n"
-        f"Style: Overlay,{font},{ost_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&HA0000000,-1,0,0,0,100,100,0,0,3,4,0,"
+        f"Style: Overlay,{ost_font},{ost_size},{primary},{primary},{outline_c},&HA0000000,-1,0,0,0,100,100,0,0,3,4,0,"
         f"8,60,60,{round(height * 0.12)},1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -128,6 +146,7 @@ def build_ass(*, width: int, height: int, captions: dict[str, Any] | None, on_sc
             lines.append(f"Dialogue: 0,{_ts(a)},{_ts(b)},Caption,,0,0,0,,{_esc(t)}")
         summary["captions"] = {"applied": bool(evs), "events": len(evs),
                                "brand_dictionary": list(cap.get("brand_dictionary") or []),
+                               "font": font,
                                "text": " ".join(t for _, _, t in evs)[:4000]}
     if ost.get("enabled"):
         texts = []

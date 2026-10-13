@@ -26,6 +26,8 @@ from app.tools.captions import write_ass
 from app.tools.ffmpeg import FFmpegTool
 from app.tools.ffprobe import FFprobeTool
 
+BRAND_MEDIA_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".mov")
+
 
 class RenderJob(BaseJob):
     """Recorta, reencuadra, añade subtítulos y watermark, y codifica."""
@@ -65,10 +67,12 @@ class RenderJob(BaseJob):
         width, height = (1080, 1920) if output_format == "9:16" else (1920, 1080)
         captions = payload.get("captions") or {}
         on_screen_text = payload.get("on_screen_text") or {}
+        branding = payload.get("branding") if isinstance(payload.get("branding"), dict) else {}
         applied: dict[str, Any] = {
             "captions": {"applied": False, "events": 0},
             "on_screen_text": {"applied": False, "texts": []},
             "watermark": {"applied": False},
+            "branding": {"applied": False},
         }
         captions_file = None
         wants_generated = (captions.get("enabled") and captions.get("segments")) or on_screen_text.get("enabled")
@@ -80,10 +84,45 @@ class RenderJob(BaseJob):
         elif wants_generated:
             ass_path = self.directory.output / "overlay.ass"
             summary = write_ass(ass_path, width=width, height=height, captions=captions,
-                                on_screen_text=on_screen_text, duration=duration)
+                                on_screen_text=on_screen_text, duration=duration, branding=branding)
             applied.update(summary)
             if summary["captions"]["applied"] or summary["on_screen_text"]["applied"]:
                 captions_file = ass_path
+
+        # Brand assets (MOLI-54): font for libass + intro/outro cards.
+        fontsdir: Path | None = None
+        brand_head: Path | None = None
+        brand_tail: Path | None = None
+        brand_meta = {"applied": False}
+        if branding:
+            font_url = branding.get("font_url") or ""
+            if font_url:
+                try:
+                    font_path = self._download_brand(font_url, ("font", ".ttf"))
+                    fontsdir = font_path.parent
+                    # libass needs the exact family; keep the file for the fontsdir
+                    # and record it for applied metadata
+                    font_ref = font_path.name
+                    brand_meta["font"] = font_ref
+                    brand_meta["applied"] = True
+                except Exception as e:  # noqa: BLE001
+                    self.logger.warning("brand font download failed; default font kept", error=str(e))
+            for side, key in (("intro", "intro"), ("outro", "outro")):
+                piece = branding.get(key) or {}
+                url = piece.get("url") or ""
+                if not url:
+                    continue
+                try:
+                    path = self._download_brand(url, (side,))
+                    if side == "intro":
+                        brand_head = path
+                    else:
+                        brand_tail = path
+                    brand_meta.setdefault("cards", []).append(side)
+                    brand_meta["applied"] = True
+                except Exception as e:  # noqa: BLE001 - a broken asset never blocks the render
+                    self.logger.warning("brand %s download failed; skipped", side, error=str(e))
+            applied["branding"] = brand_meta
 
         # Watermark / logo
         watermark = dict(payload.get("watermark") or {})
@@ -150,16 +189,41 @@ class RenderJob(BaseJob):
             watermark=watermark,
             output_fps=output_fps,
             audio_filter=audio_filter,
+            fontsdir=fontsdir,
         )
+
+        # Brand cards (MOLI-54): prepend/append intro/outro only when present.
+        # Concat is a full re-encode of head/body/tail; body keeps its own
+        # resolution and cards are normalised to it. This inflates duration —
+        # the QA duration window must allow it (render payload `qa_duration`).
+        if brand_head is not None or brand_tail is not None:
+            cap_seconds = float(branding.get("max_card_seconds") or 10.0)
+            intro_secs = float((branding.get("intro") or {}).get("max_seconds") or 1.5)
+            outro_secs = float((branding.get("outro") or {}).get("max_seconds") or 1.5)
+            head_cap = max(0.1, min(cap_seconds, intro_secs))
+            tail_cap = max(0.1, min(cap_seconds, outro_secs))
+            if brand_head is None:
+                head_cap = 0.0
+            if brand_tail is None:
+                tail_cap = 0.0
+            joined = output_path.with_name(f"_branded_{output_path.name}")
+            ffmpeg.concat_clips(head=brand_head if head_cap else None,
+                                body=output_path,
+                                tail=brand_tail if tail_cap else None,
+                                output_path=joined,
+                                max_side_seconds=max(head_cap, tail_cap))
+            joined.replace(output_path)
+            duration_seconds = max(0.0, (end - start) + head_cap + tail_cap)
+        else:
+            duration_seconds = max(0.0, end - start)
 
         self.logger.info("clip rendered", output=str(output_path))
         file_size = output_path.stat().st_size
         probe = self._probe(output_path)
         applied["frame_checks"] = self._frame_checks(output_path, applied, payload, probe, watermark)
         # Duración real del clip generado (puede diferir ligeramente de
-        # end-start por el redondeo a keyframe). La usamos en el QA y
-        # la persistimos en VPS como `duration_seconds`.
-        duration_seconds = max(0.0, end - start)
+        # end-start por el redondeo a keyframe, o crecer con intro/outro).
+        # La usamos en el QA y la persistimos en VPS como `duration_seconds`.
         return {
             # Canónico (VPS consume esto)
             "file_path": str(output_path),
@@ -196,6 +260,33 @@ class RenderJob(BaseJob):
             if not ctype.startswith("image/") or "svg" in ctype:
                 raise ValueError(f"logo URL is not a raster image ({ctype or 'unknown'}): {url}")
             dest.write_bytes(r.content)
+        return dest
+
+    def _download_brand(self, url: str, name_hint: tuple[str, ...]) -> Path:
+        """Descarga un asset de marca (fuente TTF/OTF o tarjeta intro/outro).
+
+        `name_hint` decide el nombre local (`font.ttf`, `intro.mp4`, `outro.png`);
+        la extensión real se respeta si llega (el VPS la sirve con el tipo correcto).
+        """
+        import httpx
+
+        full, headers = logo_request(
+            url, api_base_url=self.settings.api_base_url, api_token=self.settings.api_token,
+        )
+        suffix = Path(urlparse(full).path).suffix.lower()
+        if suffix not in (".ttf", ".otf", ".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".mov"):
+            suffix = ""
+        base = name_hint[0] if name_hint else "brand"
+        ext = suffix or (name_hint[1] if len(name_hint) > 1 else ".bin")
+        dest = self.directory.input / f"{base}{ext}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with httpx.Client(follow_redirects=True, timeout=120) as client:
+            r = client.get(full, headers=headers)
+            r.raise_for_status()
+            data = r.content
+            if not data:
+                raise ValueError(f"brand asset is empty: {url}")
+            dest.write_bytes(data)
         return dest
 
     def _frame_checks(self, video: Path, applied: dict, payload: dict, probe: dict, watermark: dict) -> dict[str, Any]:

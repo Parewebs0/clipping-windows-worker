@@ -122,11 +122,16 @@ class WhisperXTool:
         *,
         language: str | None = None,
         diarization: bool = False,
+        initial_prompt: str | None = None,
     ) -> dict[str, Any]:
         """Transcribe un archivo de audio y devuelve un dict estructurado.
 
         El audio se pre-carga a numpy (16kHz mono) para evitar depender del
         decoding interno de whisperx (torchcodec), que puede estar roto.
+
+        `initial_prompt` (MOLI-54): vocabulario de marca para forzar
+        ortografía exacta de los términos de la marca en la transcripción.
+        Tolerante a fallos: un warning si el pipeline lo rechaza.
         """
         whisperx = self._ensure_import()
         import numpy as np  # noqa: PLC0415
@@ -135,8 +140,18 @@ class WhisperXTool:
         device = self._resolved_device or self.settings.device
         audio = self._load_audio_numpy(audio_path)
 
-        logger.info("transcribing audio", audio=str(audio_path), device=device)
-        raw = pipeline.transcribe(audio, batch_size=16, language=language)
+        logger.info("transcribing audio", audio=str(audio_path), device=device,
+                    initial_prompt=bool(initial_prompt))
+        kwargs: dict[str, Any] = {"batch_size": 16, "language": language}
+        if initial_prompt:
+            kwargs["initial_prompt"] = initial_prompt
+        try:
+            raw = pipeline.transcribe(audio, **kwargs)
+        except TypeError:
+            # fork/versión sin initial_prompt: transcribir sin él
+            logger.warning("pipeline.transcribe rejected initial_prompt; retrying without it")
+            kwargs.pop("initial_prompt", None)
+            raw = pipeline.transcribe(audio, **kwargs)
         result = dict(raw) if not isinstance(raw, dict) else raw
 
         # El language detectado se conserva, porque `align` lo pierde.
