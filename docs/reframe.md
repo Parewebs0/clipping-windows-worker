@@ -23,7 +23,7 @@ Defecto: EMA 0.45, zona muerta 3 % del lado corto del crop, y como máximo un 5 
 
 `auto` aguanta un layout `hold_s` segundos (defecto 0.75, tope 3) antes de cambiar. Split apila en 9:16 y 1:1, y pone lado a lado en 16:9. Screenshare deja la pantalla grande (arriba, o a la izquierda en 16:9) y la cara en el otro hueco. Fit escala el plano sobre una copia desenfocada (`boxblur=20:2`).
 
-El hablante sale de la diarización. El VPS crea el transcribe con `diarization: true` y pasa los turnos en `reframe.speakers` (tiempos del clip). Si no hay turnos, se usa la cara más grande o el objeto de más peso. El emparejado hablante↔cara usa el movimiento de la boca; si no hay señal, de izquierda a derecha.
+El hablante sale de la diarización. El VPS pone `diarization: true` solo si la campaña tiene `rules_overrides.reframe.mode` distinto de `center`. Los turnos van en `reframe.speakers` (tiempos del clip). Si no hay turnos, se usa la cara más grande o el objeto de más peso. El emparejado hablante↔cara usa el movimiento de la boca; si no hay señal, de izquierda a derecha. Si `plan_reframe` lanza, el render sigue con el crop centrado y `applied.reframe.fallback` queda en `error`.
 
 Si MediaPipe o YOLO no están, o el detector falla, y el layout es `single` o `auto`, el render vuelve al crop centrado. No tumba el job.
 

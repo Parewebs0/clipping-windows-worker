@@ -26,7 +26,7 @@ def logo_request(url: str, *, api_base_url: str, api_token: str) -> tuple[str, d
 from app.tools.captions import write_ass
 from app.tools.ffmpeg import FFmpegTool
 from app.tools.ffprobe import FFprobeTool
-from app.tools.reframe import needs_source_size, output_size, plan_reframe
+from app.tools.reframe import ReframePlan, needs_source_size, output_size, plan_reframe
 
 
 class RenderJob(BaseJob):
@@ -160,19 +160,35 @@ class RenderJob(BaseJob):
             if resolution:
                 src_w, src_h = resolution
         t_plan = time.perf_counter()
-        plan = plan_reframe(
-            input_path=source,
-            start=start,
-            end=end,
-            output_format=output_format,
-            reframe=reframe_cfg,
-            src_w=src_w,
-            src_h=src_h,
-            output_fps=output_fps,
-            work_dir=work_dir,
-            ffmpeg_bin=self.settings.ffmpeg_path or "ffmpeg",
-            model_dir=Path(self.settings.working_directory) / "models",
-        )
+        try:
+            plan = plan_reframe(
+                input_path=source,
+                start=start,
+                end=end,
+                output_format=output_format,
+                reframe=reframe_cfg,
+                src_w=src_w,
+                src_h=src_h,
+                output_fps=output_fps,
+                work_dir=work_dir,
+                ffmpeg_bin=self.settings.ffmpeg_path or "ffmpeg",
+                model_dir=Path(self.settings.working_directory) / "models",
+            )
+        except Exception as exc:  # noqa: BLE001 — a bad plan must not drop the clip
+            self.logger.warning("reframe plan failed; using center crop", error=str(exc))
+            plan = ReframePlan(
+                True,
+                None,
+                None,
+                {
+                    "mode": "center",
+                    "layout": "single",
+                    "legacy": True,
+                    "fallback": "error",
+                    "timings": {},
+                },
+                [],
+            )
         plan.metadata.setdefault("timings", {})
         plan.metadata["timings"]["plan_s"] = round(time.perf_counter() - t_plan, 3)
         applied["reframe"] = plan.metadata

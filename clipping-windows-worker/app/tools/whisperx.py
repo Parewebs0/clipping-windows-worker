@@ -178,6 +178,8 @@ class WhisperXTool:
 
                 token = getattr(self.settings, "hf_token", None)
                 logger.info("running diarization", device=device, token=bool(token))
+                # whisperx 3.8.6: DiarizationPipeline(model_name=None, token=None, device=..., cache_dir=None).
+                # pyannote 4 Pipeline.from_pretrained takes token=, not use_auth_token=.
                 diarize_model = DiarizationPipeline(device=device, token=token)
                 diarize_df = diarize_model(audio)
                 result = assign_word_speakers(diarize_df, result)

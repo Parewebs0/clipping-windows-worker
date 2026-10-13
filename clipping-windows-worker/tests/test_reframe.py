@@ -441,6 +441,35 @@ def test_render_job_center_keeps_historical_filters(tmp_path, monkeypatch):
     assert seen["speakers"] == [{"start": 0.0, "end": 0.4, "speaker": "S0"}]
 
 
+def test_reframe_plan_failure_falls_back_to_center(tmp_path, monkeypatch):
+    src = _silent(tmp_path, "src.mp4", w=640, h=360, duration=0.4)
+    captured: list[dict] = []
+
+    def fake_render(self, **kwargs):
+        captured.append(kwargs)
+        Path(kwargs["output_path"]).write_bytes(b"x")
+        return Path(kwargs["output_path"])
+
+    def boom(**kwargs):
+        raise RuntimeError("detector exploded")
+
+    monkeypatch.setattr(FFmpegTool, "render_clip", fake_render)
+    monkeypatch.setattr("app.jobs.render.plan_reframe", boom)
+    monkeypatch.setattr(
+        RenderJob, "_probe",
+        lambda self, path: {"width": 1080, "height": 1920, "fps": 30, "has_audio": False, "duration": 0.4},
+    )
+    monkeypatch.setattr(RenderJob, "_frame_checks", lambda self, *args, **kwargs: {"samples": []})
+    result = RenderJob(settings=_settings(tmp_path), job=_job("boom", {
+        "input_video": str(src), "format": "9:16", "start_time": 0, "end_time": 0.4,
+        "reframe": {"mode": "face"},
+    })).execute()
+    assert captured[0]["video_filters"] is None and captured[0]["video_complex"] is None
+    assert result["applied"]["reframe"]["legacy"] is True
+    assert result["applied"]["reframe"]["fallback"] == "error"
+    assert result["applied"]["reframe"]["mode"] == "center"
+
+
 def test_tracking_render_follows_the_active_color_and_layouts_encode(tmp_path):
     src = _interview_source(tmp_path, duration=3.0)
     duration, switch = 3.0, 0.4
