@@ -14,7 +14,8 @@ import pytest
 from app.config import Settings
 from app.jobs.render import RenderJob
 from app.models.job import Job
-from app.tools.ffmpeg import cleanup_concat_graph
+from app.tools.ffmpeg import FFmpegTool, cleanup_concat_graph
+from app.utils.subprocess import CommandError
 from app.tools.speech_cleanup import (
     DEFAULT_CLEANUP,
     FADE_S,
@@ -269,3 +270,114 @@ def test_render_cleanup_shortens_the_clip_and_keeps_subtitles_in_sync(tmp_path: 
     assert start_ts.startswith("0:00:00.")
     centis = int(start_ts.split(".")[-1])
     assert centis < 200  # well before the original 3.2 s, on the shortened timeline
+
+
+def _window_source(tmp_path: Path) -> Path:
+    source = tmp_path / "src.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:size=640x360:rate=30:duration=6",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=6", "-shortest", "-pix_fmt", "yuv420p", str(source)],
+        check=True, capture_output=True,
+    )
+    return source
+
+
+def _cleanup_payload(source: Path, *, logo: Path | None = None) -> dict:
+    payload = {
+        "input_video": str(source), "format": "9:16", "start_time": 0.0, "end_time": 5.0,
+        "language": "es",
+        "captions": {"enabled": True, "segments": [{
+            "start": 0.0, "end": 5.5, "text": "hola eh mundo",
+            "words": [
+                {"start": 0.2, "end": 0.6, "word": "hola"},
+                {"start": 0.8, "end": 1.0, "word": "eh"},
+                {"start": 3.2, "end": 3.6, "word": "mundo"},
+            ],
+        }]},
+        "cleanup": {"fillers": True, "max_pause_ms": 400, "bad_takes": False, "filler_list": ["eh"]},
+    }
+    if logo is not None:
+        payload["watermark"] = {"enabled": True, "file": str(logo), "position": "top_right", "start": 1.0, "end": 3.0}
+    return payload
+
+
+def _settings(tmp_path: Path) -> Settings:
+    return Settings(
+        api_base_url="http://localhost", api_token="test", worker_id="t",
+        working_directory=str(tmp_path), output_dir=str(tmp_path / "out"),
+    )
+
+
+def _caption_line(ass: str) -> str:
+    return next(row for row in ass.splitlines() if row.startswith("Dialogue:") and "mundo" in row)
+
+
+def test_cleanup_plan_error_keeps_the_original_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("bad words")
+
+    monkeypatch.setattr("app.jobs.render.plan_cleanup", boom)
+    source = _window_source(tmp_path)
+    result = RenderJob(
+        settings=_settings(tmp_path),
+        job=_job("plan-fail", _cleanup_payload(source)),
+    ).execute()
+
+    cleanup = result["applied"]["cleanup"]
+    assert cleanup["applied"] is False
+    assert cleanup["reason"] == "error:RuntimeError"
+    assert cleanup["removed_seconds"] == 0.0
+    assert result["duration_seconds"] == pytest.approx(5.0, abs=0.15)
+    ass = (tmp_path / "jobs" / "plan-fail" / "output" / "overlay.ass").read_text(encoding="utf-8")
+    # One event across the original words: hola at 0.20 through mundo at 3.60.
+    assert _caption_line(ass) == "Dialogue: 0,0:00:00.20,0:00:03.60,Caption,,0,0,0,,hola eh mundo"
+    assert "eh" in result["applied"]["captions"]["text"]
+
+
+def test_cleanup_ffmpeg_failure_falls_back_to_the_full_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    logo = tmp_path / "logo.png"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=red:size=80x40", "-frames:v", "1", str(logo)],
+        check=True, capture_output=True,
+    )
+    calls: list = []
+    real = FFmpegTool.render_clip
+
+    def wrapped(self, **kwargs):
+        calls.append(kwargs.get("keeps"))
+        if kwargs.get("keeps"):
+            raise CommandError(["ffmpeg"], 1, "simulated cleanup failure")
+        return real(self, **kwargs)
+
+    monkeypatch.setattr(FFmpegTool, "render_clip", wrapped)
+    source = _window_source(tmp_path)
+    result = RenderJob(
+        settings=_settings(tmp_path),
+        job=_job("render-fail", _cleanup_payload(source, logo=logo)),
+    ).execute()
+
+    assert len(calls) == 2
+    assert calls[0]
+    assert calls[1] is None
+    cleanup = result["applied"]["cleanup"]
+    assert cleanup["applied"] is False
+    assert cleanup["reason"] == "render_fallback"
+    assert cleanup["removed_seconds"] == 0.0
+    assert result["duration_seconds"] == pytest.approx(5.0, abs=0.15)
+    assert result["applied"]["watermark"]["start"] == 1.0
+    assert result["applied"]["watermark"]["end"] == 3.0
+    ass = (tmp_path / "jobs" / "render-fail" / "output" / "overlay.ass").read_text(encoding="utf-8")
+    assert _caption_line(ass) == "Dialogue: 0,0:00:00.20,0:00:03.60,Caption,,0,0,0,,hola eh mundo"
+    assert "eh" in result["applied"]["captions"]["text"]
+
+
+def test_ffmpeg_error_without_keeps_still_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def boom(self, **_kwargs):
+        raise CommandError(["ffmpeg"], 1, "encode failed")
+
+    monkeypatch.setattr(FFmpegTool, "render_clip", boom)
+    source = _window_source(tmp_path)
+    payload = _cleanup_payload(source)
+    payload["cleanup"] = {"fillers": False, "max_pause_ms": None, "bad_takes": False, "filler_list": None}
+    with pytest.raises(CommandError):
+        RenderJob(settings=_settings(tmp_path), job=_job("plain-fail", payload)).execute()

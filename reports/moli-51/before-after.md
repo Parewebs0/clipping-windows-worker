@@ -1,5 +1,7 @@
 # MOLI-51 before / after
 
+Los mp4 se adjuntaron en el comentario de la issue y se quitaron del repo en la revisión.
+
 Same asset and window: a 11.185 s clip, `start=0`, `end=11.185`, 9:16.
 
 Spoken track (es-ES):

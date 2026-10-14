@@ -56,6 +56,33 @@ from app.tools.speech_cleanup import (
     remap_segments,
     remap_watermark,
 )
+from app.utils.subprocess import CommandError
+
+
+def _blank_cleanup(duration: float, reason: str, *, enabled: bool) -> dict[str, Any]:
+    """Cleanup report for a file that was not cut."""
+    return {
+        "enabled": enabled,
+        "applied": False,
+        "removed_seconds": 0.0,
+        "by_kind": {"fillers": 0.0, "pauses": 0.0, "bad_takes": 0.0},
+        "cuts": [],
+        "keeps": [],
+        "output_duration": round(max(0.0, duration), 3),
+        "reason": reason,
+    }
+
+
+def _cleanup_report(plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled": plan["enabled"],
+        "applied": plan["applied"],
+        "removed_seconds": plan["removed_seconds"],
+        "by_kind": plan["by_kind"],
+        "cuts": plan["cuts"],
+        "output_duration": plan["output_duration"],
+        "reason": plan["reason"],
+    }
 
 
 class RenderJob(BaseJob):
@@ -93,13 +120,20 @@ class RenderJob(BaseJob):
         #   Off by default (fillers/bad_takes false, max_pause_ms null): the
         #   clip is still one `-ss`/`-t` trim. When a flag is on, word times
         #   drive trim/atrim + concat and subtitle times are shifted.
+        #   A planner error (reason=error:<Type>) or a concat CommandError
+        #   (reason=render_fallback) drops back to that single trim. The
+        #   file is the original window and applied stays false.
         # Tiempos relativos al clip. `captions.file` / `watermark.file`
         # (contrato antiguo) siguen funcionando. `audio.original_only`
         # deja la pista sin loudnorm.
         duration = end - start
         width, height = (1080, 1920) if output_format == "9:16" else (1920, 1080)
-        captions = dict(payload.get("captions") or {})
-        on_screen_text = dict(payload.get("on_screen_text") or {})
+        source_captions = dict(payload.get("captions") or {})
+        source_text = dict(payload.get("on_screen_text") or {})
+        source_watermark = dict(payload.get("watermark") or {})
+        captions = dict(source_captions)
+        on_screen_text = dict(source_text)
+        watermark = dict(source_watermark)
         applied: dict[str, Any] = {
             "captions": {"applied": False, "events": 0},
             "on_screen_text": {"applied": False, "texts": []},
@@ -107,62 +141,70 @@ class RenderJob(BaseJob):
         }
         has_audio = FFprobeTool(self.settings).get_audio_stream(source) is not None
         language = payload.get("language")
-        plan = plan_cleanup(
-            captions.get("segments") or [],
-            duration=duration,
-            options=cleanup_options(payload),
-            language=str(language) if language else None,
-        )
-        if plan["applied"] and not has_audio:
-            plan = {
-                "enabled": plan["enabled"],
-                "applied": False,
-                "removed_seconds": 0.0,
-                "by_kind": {"fillers": 0.0, "pauses": 0.0, "bad_takes": 0.0},
-                "cuts": [],
-                "keeps": [],
-                "output_duration": round(duration, 3),
-                "reason": "no_audio",
-            }
-        keeps = keep_ranges(plan)
-        overlay_duration = float(plan["output_duration"]) if keeps else duration
-        if keeps:
-            captions["segments"] = remap_segments(captions.get("segments") or [], keeps)
-            if on_screen_text.get("items"):
-                on_screen_text["items"] = remap_items(
-                    on_screen_text.get("items") or [],
-                    keeps,
-                    source_duration=duration,
-                )
-        applied["cleanup"] = {
-            "enabled": plan["enabled"],
-            "applied": plan["applied"],
-            "removed_seconds": plan["removed_seconds"],
-            "by_kind": plan["by_kind"],
-            "cuts": plan["cuts"],
-            "output_duration": plan["output_duration"],
-            "reason": plan["reason"],
-        }
+        options = cleanup_options(payload)
+        cleanup_enabled = bool(options["fillers"] or options["bad_takes"] or options["max_pause_ms"])
+        try:
+            plan = plan_cleanup(
+                captions.get("segments") or [],
+                duration=duration,
+                options=options,
+                language=str(language) if language else None,
+            )
+            if plan["applied"] and not has_audio:
+                plan = _blank_cleanup(duration, "no_audio", enabled=bool(plan["enabled"]))
+            keeps = keep_ranges(plan)
+            overlay_duration = float(plan["output_duration"]) if keeps else duration
+            if keeps:
+                captions["segments"] = remap_segments(captions.get("segments") or [], keeps)
+                if on_screen_text.get("items"):
+                    on_screen_text["items"] = remap_items(
+                        on_screen_text.get("items") or [],
+                        keeps,
+                        source_duration=duration,
+                    )
+                watermark = remap_watermark(watermark, keeps, source_duration=duration)
+        except Exception as exc:
+            self.logger.warning(
+                "speech cleanup plan failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            plan = _blank_cleanup(duration, f"error:{type(exc).__name__}", enabled=cleanup_enabled)
+            keeps = None
+            overlay_duration = duration
+            captions = dict(source_captions)
+            on_screen_text = dict(source_text)
+            watermark = dict(source_watermark)
+        applied["cleanup"] = _cleanup_report(plan)
 
         captions_file = None
-        wants_generated = (captions.get("enabled") and captions.get("segments")) or on_screen_text.get("enabled")
-        if captions.get("enabled") and captions.get("file") and not captions.get("segments"):
-            captions_file = self._resolve_input(captions["file"])
-            applied["captions"] = {"applied": True, "events": None, "file": str(captions_file)}
-            if on_screen_text.get("enabled"):
-                self.logger.warning("on_screen_text ignored: captions.file given (send segments instead)")
-        elif wants_generated:
-            ass_path = self.directory.output / "overlay.ass"
-            summary = write_ass(ass_path, width=width, height=height, captions=captions,
-                                on_screen_text=on_screen_text, duration=overlay_duration)
+        ass_path = self.directory.output / "overlay.ass"
+
+        def write_overlay(caps: dict[str, Any], text: dict[str, Any], span: float) -> None:
+            nonlocal captions_file
+            wants_generated = (caps.get("enabled") and caps.get("segments")) or text.get("enabled")
+            if caps.get("enabled") and caps.get("file") and not caps.get("segments"):
+                captions_file = self._resolve_input(caps["file"])
+                applied["captions"] = {"applied": True, "events": None, "file": str(captions_file)}
+                if text.get("enabled"):
+                    self.logger.warning("on_screen_text ignored: captions.file given (send segments instead)")
+                return
+            if not wants_generated:
+                captions_file = None
+                return
+            summary = write_ass(
+                ass_path, width=width, height=height, captions=caps,
+                on_screen_text=text, duration=span,
+            )
             applied.update(summary)
             if summary["captions"]["applied"] or summary["on_screen_text"]["applied"]:
                 captions_file = ass_path
+            else:
+                captions_file = None
 
-        # Watermark / logo
-        watermark = dict(payload.get("watermark") or {})
-        if keeps:
-            watermark = remap_watermark(watermark, keeps, source_duration=duration)
+        write_overlay(captions, on_screen_text, overlay_duration)
+
+        # Watermark / logo. Times were already shifted when cleanup applied.
         if watermark.get("enabled"):
             if watermark.get("file"):
                 watermark["file"] = str(self._resolve_input(watermark["file"]))
@@ -218,7 +260,7 @@ class RenderJob(BaseJob):
             decider=decider_options(payload),
             cleanup_removed=plan["removed_seconds"],
         )
-        ffmpeg.render_clip(
+        clip_kwargs = dict(
             input_path=source,
             output_path=output_path,
             start=start,
@@ -230,6 +272,57 @@ class RenderJob(BaseJob):
             audio_filter=audio_filter,
             keeps=keeps,
         )
+        try:
+            ffmpeg.render_clip(**clip_kwargs)
+        except CommandError as exc:
+            if not keeps:
+                raise
+            self.logger.warning(
+                "speech cleanup render failed; using the full window",
+                error=str(exc),
+            )
+            keeps = None
+            overlay_duration = duration
+            captions = dict(source_captions)
+            on_screen_text = dict(source_text)
+            resolved_logo = watermark.get("file")
+            watermark = dict(source_watermark)
+            if resolved_logo:
+                watermark["file"] = resolved_logo
+            write_overlay(captions, on_screen_text, duration)
+            if watermark.get("enabled") and watermark.get("file"):
+                applied["watermark"] = {
+                    "applied": True,
+                    "position": watermark.get("position", "top_right"),
+                    "width": int(watermark.get("width", 180)),
+                    "start": watermark.get("start"),
+                    "end": watermark.get("end"),
+                    "source": watermark.get("url") or Path(str(watermark["file"])).name,
+                }
+            audio_meta, audio_filter = ffmpeg.prepare_loudnorm(
+                source,
+                start=start,
+                duration=duration,
+                original_only=original_only,
+                has_audio=has_audio,
+                keeps=None,
+            )
+            applied["audio"] = audio_meta
+            applied["cleanup"] = _cleanup_report(
+                _blank_cleanup(duration, "render_fallback", enabled=bool(plan["enabled"])),
+            )
+            ffmpeg.render_clip(
+                input_path=source,
+                output_path=output_path,
+                start=start,
+                end=end,
+                output_format=output_format,
+                captions_file=captions_file,
+                watermark=watermark,
+                output_fps=output_fps,
+                audio_filter=audio_filter,
+                keeps=None,
+            )
 
         self.logger.info("clip rendered", output=str(output_path))
         file_size = output_path.stat().st_size
