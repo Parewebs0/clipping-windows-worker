@@ -48,6 +48,14 @@ def logo_request(url: str, *, api_base_url: str, api_token: str) -> tuple[str, d
 from app.tools.captions import write_ass
 from app.tools.ffmpeg import FFmpegTool
 from app.tools.ffprobe import FFprobeTool
+from app.tools.speech_cleanup import (
+    cleanup_options,
+    keep_ranges,
+    plan_cleanup,
+    remap_items,
+    remap_segments,
+    remap_watermark,
+)
 
 
 class RenderJob(BaseJob):
@@ -81,18 +89,61 @@ class RenderJob(BaseJob):
         # watermark{enabled, file | url, position, width, start, end}
         # on_screen_text{enabled, items[{text, start, end, position}]}
         # audio{original_only, normalize, target_lufs, true_peak_db}
+        # cleanup{fillers, max_pause_ms, bad_takes, filler_list}
+        #   Off by default (fillers/bad_takes false, max_pause_ms null): the
+        #   clip is still one `-ss`/`-t` trim. When a flag is on, word times
+        #   drive trim/atrim + concat and subtitle times are shifted.
         # Tiempos relativos al clip. `captions.file` / `watermark.file`
         # (contrato antiguo) siguen funcionando. `audio.original_only`
         # deja la pista sin loudnorm.
         duration = end - start
         width, height = (1080, 1920) if output_format == "9:16" else (1920, 1080)
-        captions = payload.get("captions") or {}
-        on_screen_text = payload.get("on_screen_text") or {}
+        captions = dict(payload.get("captions") or {})
+        on_screen_text = dict(payload.get("on_screen_text") or {})
         applied: dict[str, Any] = {
             "captions": {"applied": False, "events": 0},
             "on_screen_text": {"applied": False, "texts": []},
             "watermark": {"applied": False},
         }
+        has_audio = FFprobeTool(self.settings).get_audio_stream(source) is not None
+        language = payload.get("language")
+        plan = plan_cleanup(
+            captions.get("segments") or [],
+            duration=duration,
+            options=cleanup_options(payload),
+            language=str(language) if language else None,
+        )
+        if plan["applied"] and not has_audio:
+            plan = {
+                "enabled": plan["enabled"],
+                "applied": False,
+                "removed_seconds": 0.0,
+                "by_kind": {"fillers": 0.0, "pauses": 0.0, "bad_takes": 0.0},
+                "cuts": [],
+                "keeps": [],
+                "output_duration": round(duration, 3),
+                "reason": "no_audio",
+            }
+        keeps = keep_ranges(plan)
+        overlay_duration = float(plan["output_duration"]) if keeps else duration
+        if keeps:
+            captions["segments"] = remap_segments(captions.get("segments") or [], keeps)
+            if on_screen_text.get("items"):
+                on_screen_text["items"] = remap_items(
+                    on_screen_text.get("items") or [],
+                    keeps,
+                    source_duration=duration,
+                )
+        applied["cleanup"] = {
+            "enabled": plan["enabled"],
+            "applied": plan["applied"],
+            "removed_seconds": plan["removed_seconds"],
+            "by_kind": plan["by_kind"],
+            "cuts": plan["cuts"],
+            "output_duration": plan["output_duration"],
+            "reason": plan["reason"],
+        }
+
         captions_file = None
         wants_generated = (captions.get("enabled") and captions.get("segments")) or on_screen_text.get("enabled")
         if captions.get("enabled") and captions.get("file") and not captions.get("segments"):
@@ -103,13 +154,15 @@ class RenderJob(BaseJob):
         elif wants_generated:
             ass_path = self.directory.output / "overlay.ass"
             summary = write_ass(ass_path, width=width, height=height, captions=captions,
-                                on_screen_text=on_screen_text, duration=duration)
+                                on_screen_text=on_screen_text, duration=overlay_duration)
             applied.update(summary)
             if summary["captions"]["applied"] or summary["on_screen_text"]["applied"]:
                 captions_file = ass_path
 
         # Watermark / logo
         watermark = dict(payload.get("watermark") or {})
+        if keeps:
+            watermark = remap_watermark(watermark, keeps, source_duration=duration)
         if watermark.get("enabled"):
             if watermark.get("file"):
                 watermark["file"] = str(self._resolve_input(watermark["file"]))
@@ -145,13 +198,13 @@ class RenderJob(BaseJob):
         ffmpeg = FFmpegTool(self.settings)
         audio_payload = payload.get("audio") if isinstance(payload.get("audio"), dict) else {}
         original_only = bool(audio_payload.get("original_only"))
-        has_audio = FFprobeTool(self.settings).get_audio_stream(source) is not None
         audio_meta, audio_filter = ffmpeg.prepare_loudnorm(
             source,
             start=start,
-            duration=duration,
+            duration=overlay_duration if keeps else duration,
             original_only=original_only,
             has_audio=has_audio,
+            keeps=keeps,
         )
         applied["audio"] = audio_meta
 
@@ -163,6 +216,7 @@ class RenderJob(BaseJob):
             format=output_format,
             output_fps=output_fps,
             decider=decider_options(payload),
+            cleanup_removed=plan["removed_seconds"],
         )
         ffmpeg.render_clip(
             input_path=source,
@@ -174,16 +228,26 @@ class RenderJob(BaseJob):
             watermark=watermark,
             output_fps=output_fps,
             audio_filter=audio_filter,
+            keeps=keeps,
         )
 
         self.logger.info("clip rendered", output=str(output_path))
         file_size = output_path.stat().st_size
         probe = self._probe(output_path)
-        applied["frame_checks"] = self._frame_checks(output_path, applied, payload, probe, watermark)
+        check_payload = payload
+        if keeps:
+            check_payload = dict(payload)
+            check_payload["captions"] = captions
+        applied["frame_checks"] = self._frame_checks(output_path, applied, check_payload, probe, watermark)
         # Duración real del clip generado (puede diferir ligeramente de
         # end-start por el redondeo a keyframe). La usamos en el QA y
         # la persistimos en VPS como `duration_seconds`.
+        # Cleanup off: keep end-start. Cleanup on: the file is shorter, so
+        # store the probed length QA will measure.
         duration_seconds = max(0.0, end - start)
+        if keeps:
+            probed = probe.get("duration")
+            duration_seconds = float(probed) if isinstance(probed, (int, float)) else overlay_duration
         return {
             # Canónico (VPS consume esto)
             "file_path": str(output_path),

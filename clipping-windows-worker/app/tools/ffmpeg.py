@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import Settings
+from app.tools.speech_cleanup import FADE_S
 from app.utils.logging import get_logger
 from app.utils.subprocess import run_command
 
@@ -53,6 +54,50 @@ def loudnorm_filter(measured: dict[str, Any] | None = None) -> str:
         return chain
     measured_opts = ":".join(f"{key}={value}" for key, value in fields.items())
     return f"{chain}:{measured_opts}:linear=true"
+
+
+def cleanup_concat_graph(
+    keeps: list[tuple[float, float]],
+    *,
+    fade_s: float = FADE_S,
+    video: bool = True,
+) -> str:
+    """trim/atrim + concat, with a 10–20 ms afade on each audio piece.
+
+    Labels the joined streams `[vcat]` (when `video`) and `[acat]`.
+    Keep times are seconds relative to the already-seeked clip.
+    """
+    if not keeps:
+        raise ValueError("cleanup concat needs at least one keep range")
+    parts: list[str] = []
+    vlabels: list[str] = []
+    alabels: list[str] = []
+    single = len(keeps) == 1
+    for index, (start, end) in enumerate(keeps):
+        dur = max(0.0, end - start)
+        fade = fade_s if dur >= 0.050 and 0.010 <= fade_s <= 0.020 else 0.0
+        vlabel = "[vcat]" if single else f"[v{index}]"
+        alabel = "[acat]" if single else f"[a{index}]"
+        if video:
+            parts.append(f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS{vlabel}")
+            vlabels.append(vlabel)
+        fade_chain = ""
+        if fade:
+            fade_chain = f",afade=t=in:st=0:d={fade:.3f},afade=t=out:st={max(0.0, dur - fade):.3f}:d={fade:.3f}"
+        parts.append(
+            f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS,"
+            f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo{fade_chain}{alabel}"
+        )
+        alabels.append(alabel)
+    if not single:
+        interleaved = "".join(
+            (vlabels[index] if video else "") + alabels[index] for index in range(len(keeps))
+        )
+        if video:
+            parts.append(f"{interleaved}concat=n={len(keeps)}:v=1:a=1[vcat][acat]")
+        else:
+            parts.append(f"{interleaved}concat=n={len(keeps)}:v=0:a=1[acat]")
+    return ";".join(parts)
 
 
 def parse_loudnorm_json(stderr: str) -> dict[str, Any] | None:
@@ -122,12 +167,15 @@ class FFmpegTool:
         duration: float,
         original_only: bool,
         has_audio: bool,
+        keeps: list[tuple[float, float]] | None = None,
     ) -> tuple[dict[str, Any], str | None]:
         """Decide loudnorm for this clip. Returns `(applied.audio, filter or None)`.
 
         `audio.original_only` leaves the track untouched. No audio stream means
         there is nothing to normalize. Otherwise measure, then linear loudnorm
         to -14 LUFS / -1 dBTP (single-pass if the measure is unusable).
+        `keeps` measures the concatenated speech-cleanup timeline instead of
+        the whole window, so removed silence does not pull the loudness down.
         """
         meta: dict[str, Any] = {
             "normalized": False,
@@ -142,7 +190,10 @@ class FFmpegTool:
         if not has_audio:
             meta["reason"] = "no_audio"
             return meta, None
-        measured = self._measure_loudnorm(input_path, start=start, duration=duration)
+        if keeps:
+            measured = self._measure_loudnorm_keeps(input_path, start=start, keeps=keeps)
+        else:
+            measured = self._measure_loudnorm(input_path, start=start, duration=duration)
         chain = loudnorm_filter(measured)
         meta["normalized"] = True
         meta["filter"] = "loudnorm"
@@ -177,6 +228,40 @@ class FFmpegTool:
             logger.warning("loudnorm measure returned no json")
         return parsed
 
+    def _measure_loudnorm_keeps(
+        self,
+        input_path: str | Path,
+        *,
+        start: float,
+        keeps: list[tuple[float, float]],
+    ) -> dict[str, Any] | None:
+        graph = cleanup_concat_graph(keeps, video=False)
+        graph = f"{graph};[acat]{loudnorm_filter()}:print_format=json[aout]"
+        command = [
+            self._binary,
+            "-hide_banner",
+            "-ss",
+            f"{start:.3f}",
+            "-i",
+            str(input_path),
+            "-filter_complex",
+            graph,
+            "-map",
+            "[aout]",
+            "-f",
+            "null",
+            "-",
+        ]
+        try:
+            result = run_command(command, timeout=600)
+        except Exception as exc:  # noqa: BLE001 - unusable measure falls back to single-pass
+            logger.warning("loudnorm measure failed", error=str(exc))
+            return None
+        parsed = parse_loudnorm_json(result.stderr or "")
+        if parsed is None:
+            logger.warning("loudnorm measure returned no json")
+        return parsed
+
     def render_clip(
         self,
         *,
@@ -189,8 +274,12 @@ class FFmpegTool:
         watermark: dict[str, Any] | None = None,
         output_fps: float = 30.0,
         audio_filter: str | None = None,
+        keeps: list[tuple[float, float]] | None = None,
     ) -> Path:
         """Renderiza un clip: trim + crop/scale + subtítulos + watermark + encode.
+
+        `keeps` (clip-relative) switches to trim/atrim + concat. None keeps the
+        single `-ss`/`-t` path, which is the default when speech cleanup is off.
 
         ``output_format`` soporta "9:16" (1080x1920) y "16:9" (1920x1080).
 
@@ -204,6 +293,19 @@ class FFmpegTool:
         """
         output = Path(output_path)
         duration = max(0.0, end - start)
+        if keeps:
+            return self._render_kept_segments(
+                input_path=input_path,
+                output_path=output,
+                start=start,
+                end=end,
+                output_format=output_format,
+                captions_file=captions_file,
+                watermark=watermark,
+                output_fps=output_fps,
+                audio_filter=audio_filter,
+                keeps=keeps,
+            )
 
         # --- Filtros de vídeo (crop/scale) ---
         vf_parts: list[str] = []
@@ -327,6 +429,104 @@ class FFmpegTool:
         )
         run_command(command, timeout=3600, cwd=vfilter_cwd)
         return output
+
+    def _render_kept_segments(
+        self,
+        *,
+        input_path: str | Path,
+        output_path: Path,
+        start: float,
+        end: float,
+        output_format: str,
+        captions_file: str | Path | None,
+        watermark: dict[str, Any] | None,
+        output_fps: float,
+        audio_filter: str | None,
+        keeps: list[tuple[float, float]],
+    ) -> Path:
+        """Join keep ranges with trim/atrim + concat + a short audio fade."""
+        vf_parts: list[str] = []
+        if output_format == "9:16":
+            vf_parts.append("crop=ih*9/16:ih")
+            vf_parts.append("scale=1080:1920:force_original_aspect_ratio=decrease")
+            vf_parts.append("pad=1080:1920:(ow-iw)/2:(oh-ih)/2")
+        elif output_format == "16:9":
+            vf_parts.append("crop=iw:iw*9/16")
+            vf_parts.append("scale=1920:1080:force_original_aspect_ratio=decrease")
+            vf_parts.append("pad=1920:1080:(ow-iw)/2:(oh-ih)/2")
+        else:
+            raise ValueError(f"Unsupported output_format: {output_format}")
+
+        vfilter_cwd: str | None = None
+        if captions_file:
+            cf = Path(captions_file)
+            vf_parts.append(self._subtitle_filter(cf.name))
+            vfilter_cwd = str(cf.parent)
+
+        duration = max(0.0, end - start)
+        graph = cleanup_concat_graph(keeps, video=True)
+        graph = f"{graph};[vcat]{','.join(vf_parts)}[vmain]"
+
+        has_watermark = bool(watermark and watermark.get("enabled"))
+        command = [
+            self._binary,
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-i",
+            str(input_path),
+        ]
+        if has_watermark:
+            wm_file = watermark.get("file")
+            if not wm_file:
+                raise ValueError("watermark.file is required when watermark.enabled=true")
+            command += ["-i", str(wm_file)]
+            width = int(watermark.get("width", 180))
+            x, y = self._position_xy(
+                watermark.get("position", "top_right"),
+                int(watermark.get("margin_x", 40)),
+                int(watermark.get("margin_y", 40)),
+            )
+            enable = ""
+            wm_start, wm_end = watermark.get("start"), watermark.get("end")
+            if wm_start is not None or wm_end is not None:
+                a = float(wm_start or 0.0)
+                b = float(wm_end) if wm_end is not None else sum(stop - begin for begin, stop in keeps)
+                enable = f":enable='between(t,{a:.3f},{b:.3f})'"
+            graph += (
+                f";[1:v]scale={width}:-1[wm];"
+                f"[vmain][wm]overlay={x}:{y}{enable}[vout]"
+            )
+            vout = "[vout]"
+        else:
+            vout = "[vmain]"
+
+        if audio_filter:
+            graph += f";[acat]{audio_filter}[aout]"
+            aout = "[aout]"
+        else:
+            aout = "[acat]"
+
+        command += ["-filter_complex", graph, "-map", vout, "-map", aout]
+        if output_fps and output_fps > 0:
+            command += ["-r", f"{output_fps:.3f}"]
+        command += [
+            "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+            str(output_path),
+        ]
+        logger.info(
+            "rendering cleaned clip",
+            input=str(input_path),
+            output=str(output_path),
+            start=start,
+            keeps=len(keeps),
+            duration=round(duration, 3),
+            watermark=has_watermark,
+            loudnorm=bool(audio_filter),
+        )
+        run_command(command, timeout=3600, cwd=vfilter_cwd)
+        return output_path
 
     @staticmethod
     def _position_xy(position: str, margin_x: int, margin_y: int) -> tuple[str, str]:
