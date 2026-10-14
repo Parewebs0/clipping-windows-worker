@@ -47,6 +47,8 @@ worker_run.log
 
 # --- Vídeos y binarios grandes ---
 *.mp4
+# MOLI-55: the before/after pair attached to the PR is the exception.
+!reports/moli-55/*.mp4
 *.mov
 *.mkv
 *.avi

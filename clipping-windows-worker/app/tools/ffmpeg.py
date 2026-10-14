@@ -328,6 +328,15 @@ class FFmpegTool:
         run_command(command, timeout=3600, cwd=vfilter_cwd)
         return output
 
+    def render_production(self, **kwargs: Any) -> Path:
+        """Encode a clip whose render_spec turned on b-roll, music, xfade or SFX."""
+        from app.tools.production import production_command
+
+        output = Path(kwargs["output_path"])
+        command, cwd = production_command(binary=self._binary, **kwargs)
+        run_command(command, timeout=3600, cwd=cwd)
+        return output
+
     @staticmethod
     def _position_xy(position: str, margin_x: int, margin_y: int) -> tuple[str, str]:
         """Devuelve (x, y) para el overlay según la posición y márgenes."""

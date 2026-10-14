@@ -155,6 +155,22 @@ class RenderJob(BaseJob):
         )
         applied["audio"] = audio_meta
 
+        from app.tools.production import features_requested, prepare_production
+
+        production = None
+        if features_requested(payload):
+            production = prepare_production(
+                payload,
+                duration=duration,
+                original_only=original_only,
+                work_dir=self.directory.input,
+                binary=ffmpeg._binary,
+                pexels_key=self.settings.pexels_api_key,
+                pixabay_key=self.settings.pixabay_api_key,
+                has_speech=has_audio,
+            )
+            applied.update(production["applied"])
+
         self.logger.info(
             "rendering clip",
             input=str(source),
@@ -164,17 +180,35 @@ class RenderJob(BaseJob):
             output_fps=output_fps,
             decider=decider_options(payload),
         )
-        ffmpeg.render_clip(
-            input_path=source,
-            output_path=output_path,
-            start=start,
-            end=end,
-            output_format=output_format,
-            captions_file=captions_file,
-            watermark=watermark,
-            output_fps=output_fps,
-            audio_filter=audio_filter,
-        )
+        if production and production["use_graph"]:
+            ffmpeg.render_production(
+                source=str(source),
+                output_path=str(output_path),
+                start=start,
+                duration=duration,
+                output_format=output_format,
+                output_fps=output_fps,
+                captions_file=str(captions_file) if captions_file else None,
+                watermark=watermark if watermark.get("enabled") else None,
+                broll=production["broll"],
+                music=production["music"],
+                sfx=production["sfx"],
+                transitions=production["transitions"],
+                audio_filter=audio_filter,
+                has_speech=has_audio,
+            )
+        else:
+            ffmpeg.render_clip(
+                input_path=source,
+                output_path=output_path,
+                start=start,
+                end=end,
+                output_format=output_format,
+                captions_file=captions_file,
+                watermark=watermark,
+                output_fps=output_fps,
+                audio_filter=audio_filter,
+            )
 
         self.logger.info("clip rendered", output=str(output_path))
         file_size = output_path.stat().st_size
