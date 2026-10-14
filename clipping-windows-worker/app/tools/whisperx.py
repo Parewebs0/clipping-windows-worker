@@ -12,6 +12,7 @@ arrancar y reportar health incluso si WhisperX no está instalado.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Any
 
@@ -131,10 +132,13 @@ class WhisperXTool:
 
         `initial_prompt` (MOLI-54): vocabulario de marca para forzar
         ortografía exacta de los términos de la marca en la transcripción.
-        Tolerante a fallos: un warning si el pipeline lo rechaza.
+
+        whisperx 3.8.6 (`FasterWhisperPipeline.transcribe`) no acepta
+        `initial_prompt`. El prompt vive en `pipeline.options`
+        (`TranscriptionOptions`, dataclass). Se sustituye solo durante la
+        llamada y se restaura después, también si `transcribe` falla.
         """
         whisperx = self._ensure_import()
-        import numpy as np  # noqa: PLC0415
 
         pipeline = self._load_model(whisperx, language)
         device = self._resolved_device or self.settings.device
@@ -143,15 +147,26 @@ class WhisperXTool:
         logger.info("transcribing audio", audio=str(audio_path), device=device,
                     initial_prompt=bool(initial_prompt))
         kwargs: dict[str, Any] = {"batch_size": 16, "language": language}
+        previous_options = None
         if initial_prompt:
-            kwargs["initial_prompt"] = initial_prompt
+            options = getattr(pipeline, "options", None)
+            if dataclasses.is_dataclass(options) and not isinstance(options, type):
+                try:
+                    pipeline.options = dataclasses.replace(options, initial_prompt=initial_prompt)
+                    previous_options = options
+                except TypeError:
+                    logger.warning(
+                        "whisperx options have no initial_prompt; transcribing without it",
+                    )
+            else:
+                logger.warning(
+                    "whisperx pipeline.options is not a dataclass; transcribing without initial_prompt",
+                )
         try:
             raw = pipeline.transcribe(audio, **kwargs)
-        except TypeError:
-            # fork/versión sin initial_prompt: transcribir sin él
-            logger.warning("pipeline.transcribe rejected initial_prompt; retrying without it")
-            kwargs.pop("initial_prompt", None)
-            raw = pipeline.transcribe(audio, **kwargs)
+        finally:
+            if previous_options is not None:
+                pipeline.options = previous_options
         result = dict(raw) if not isinstance(raw, dict) else raw
 
         # El language detectado se conserva, porque `align` lo pierde.

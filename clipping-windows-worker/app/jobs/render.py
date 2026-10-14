@@ -27,6 +27,29 @@ from app.tools.ffmpeg import FFmpegTool
 from app.tools.ffprobe import FFprobeTool
 
 BRAND_MEDIA_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".mov")
+# Worker routes for intro/outro have no suffix (`/branding/intro`). The
+# VPS sets Content-Type from the stored file (video/mp4, image/png, …).
+_CONTENT_TYPE_SUFFIX = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/quicktime": ".mov",
+    "font/ttf": ".ttf",
+    "font/otf": ".otf",
+    "application/x-font-ttf": ".ttf",
+    "application/x-font-otf": ".otf",
+    "application/font-sfnt": ".ttf",
+    "application/vnd.ms-opentype": ".otf",
+}
+
+
+def suffix_for_content_type(content_type: str) -> str:
+    """File suffix for a Content-Type, or "" when the type is not a brand asset."""
+    media = (content_type or "").split(";", 1)[0].strip().lower()
+    return _CONTENT_TYPE_SUFFIX.get(media, "")
 
 
 class RenderJob(BaseJob):
@@ -207,13 +230,22 @@ class RenderJob(BaseJob):
             if brand_tail is None:
                 tail_cap = 0.0
             joined = output_path.with_name(f"_branded_{output_path.name}")
-            ffmpeg.concat_clips(head=brand_head if head_cap else None,
-                                body=output_path,
-                                tail=brand_tail if tail_cap else None,
-                                output_path=joined,
-                                max_side_seconds=max(head_cap, tail_cap))
-            joined.replace(output_path)
-            duration_seconds = max(0.0, (end - start) + head_cap + tail_cap)
+            try:
+                ffmpeg.concat_clips(head=brand_head if head_cap else None,
+                                    body=output_path,
+                                    tail=brand_tail if tail_cap else None,
+                                    output_path=joined,
+                                    max_side_seconds=max(head_cap, tail_cap))
+                joined.replace(output_path)
+                duration_seconds = max(0.0, (end - start) + head_cap + tail_cap)
+            except Exception as e:  # noqa: BLE001 - a failed concat must not drop the clip
+                self.logger.warning(
+                    "brand card concat failed; keeping clip without cards", error=str(e),
+                )
+                brand_meta["cards_error"] = str(e)[:500]
+                if joined.exists():
+                    joined.unlink()
+                duration_seconds = max(0.0, end - start)
         else:
             duration_seconds = max(0.0, end - start)
 
@@ -265,28 +297,35 @@ class RenderJob(BaseJob):
     def _download_brand(self, url: str, name_hint: tuple[str, ...]) -> Path:
         """Descarga un asset de marca (fuente TTF/OTF o tarjeta intro/outro).
 
-        `name_hint` decide el nombre local (`font.ttf`, `intro.mp4`, `outro.png`);
-        la extensión real se respeta si llega (el VPS la sirve con el tipo correcto).
+        Intro/outro se sirven en `/worker/campaigns/{id}/branding/{side}` sin
+        extensión. Sin sufijo el fichero caía en `.bin` y un MP4 se concatenaba
+        como imagen fija. La extensión sale de la URL si es un tipo conocido y,
+        si no, del Content-Type (`video/mp4`, `image/png`, …).
         """
         import httpx
 
         full, headers = logo_request(
             url, api_base_url=self.settings.api_base_url, api_token=self.settings.api_token,
         )
-        suffix = Path(urlparse(full).path).suffix.lower()
-        if suffix not in (".ttf", ".otf", ".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".mov"):
-            suffix = ""
-        base = name_hint[0] if name_hint else "brand"
-        ext = suffix or (name_hint[1] if len(name_hint) > 1 else ".bin")
-        dest = self.directory.input / f"{base}{ext}"
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        url_suffix = Path(urlparse(full).path).suffix.lower()
+        if url_suffix not in (".ttf", ".otf", ".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".mov"):
+            url_suffix = ""
         with httpx.Client(follow_redirects=True, timeout=120) as client:
             r = client.get(full, headers=headers)
             r.raise_for_status()
             data = r.content
-            if not data:
-                raise ValueError(f"brand asset is empty: {url}")
-            dest.write_bytes(data)
+            content_type = r.headers.get("content-type", "")
+        if not data:
+            raise ValueError(f"brand asset is empty: {url}")
+        base = name_hint[0] if name_hint else "brand"
+        ext = url_suffix or suffix_for_content_type(content_type)
+        if not ext and len(name_hint) > 1:
+            ext = name_hint[1]
+        if not ext:
+            ext = ".bin"
+        dest = self.directory.input / f"{base}{ext}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
         return dest
 
     def _frame_checks(self, video: Path, applied: dict, payload: dict, probe: dict, watermark: dict) -> dict[str, Any]:

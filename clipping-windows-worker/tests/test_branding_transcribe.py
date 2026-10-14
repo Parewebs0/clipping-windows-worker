@@ -1,5 +1,6 @@
-"""MOLI-54 — transcribe: initial_prompt accepted (and tolerated when unsupported)."""
+"""MOLI-54 — transcribe: initial_prompt goes through pipeline.options (whisperx 3.8.6)."""
 
+import dataclasses
 from types import SimpleNamespace
 
 from app.tools.whisperx import WhisperXTool
@@ -23,42 +24,75 @@ def _tool(monkeypatch, pipeline):
     return WhisperXTool(settings=settings)
 
 
-def test_initial_prompt_reaches_whisperx(monkeypatch):
-    captured = {}
+@dataclasses.dataclass
+class _Options:
+    initial_prompt: str | None = None
+    beam_size: int = 5
 
-    def fake_pipeline_transcribe(audio, **kwargs):
-        captured.update(kwargs)
-        return {"language": "es", "segments": [{"start": 0.0, "end": 1.0, "text": "hola"}]}
+
+def test_initial_prompt_is_set_on_options_and_restored(monkeypatch):
+    """whisperx 3.8.6 reads initial_prompt from pipeline.options, not transcribe()."""
+    captured = {}
+    original = _Options()
 
     class FakePipeline:
-        transcribe = staticmethod(fake_pipeline_transcribe)
+        def __init__(self):
+            self.options = original
 
-    tool = _tool(monkeypatch, FakePipeline())
+        def transcribe(self, audio, **kwargs):
+            captured["kwargs"] = kwargs
+            captured["during"] = self.options.initial_prompt
+            return {"language": "es", "segments": [{"start": 0.0, "end": 1.0, "text": "hola"}]}
+
+    pipeline = FakePipeline()
+    tool = _tool(monkeypatch, pipeline)
     out = tool.transcribe("audio.wav", language="es", initial_prompt="BOXABL CASITA")
     assert out["language"] == "es"
-    assert captured.get("initial_prompt") == "BOXABL CASITA"
+    assert captured["during"] == "BOXABL CASITA"
+    assert "initial_prompt" not in captured["kwargs"]
+    assert pipeline.options is original
+    assert original.initial_prompt is None
 
 
-def test_initial_prompt_typeerror_fallback(monkeypatch):
-    """Older fork without initial_prompt: second attempt without it succeeds."""
-    calls = []
-
-    def fake_pipeline_transcribe(audio, batch_size=None, language=None, initial_prompt=None):
-        calls.append(initial_prompt)
-        if initial_prompt is not None:
-            raise TypeError("unexpected keyword argument 'initial_prompt'")
-        return {"language": "en", "segments": []}
+def test_initial_prompt_restored_when_transcribe_fails(monkeypatch):
+    original = _Options(initial_prompt="keep-me")
 
     class FakePipeline:
-        transcribe = staticmethod(fake_pipeline_transcribe)
+        def __init__(self):
+            self.options = original
+
+        def transcribe(self, audio, **kwargs):
+            assert self.options.initial_prompt == "BOXABL"
+            raise RuntimeError("vad failed")
+
+    pipeline = FakePipeline()
+    tool = _tool(monkeypatch, pipeline)
+    try:
+        tool.transcribe("audio.wav", language="en", initial_prompt="BOXABL")
+    except RuntimeError as exc:
+        assert str(exc) == "vad failed"
+    else:
+        raise AssertionError("transcribe should have raised")
+    assert pipeline.options is original
+    assert original.initial_prompt == "keep-me"
+
+
+def test_initial_prompt_skipped_when_options_are_missing(monkeypatch):
+    """No dataclass options: transcribe still runs, and the kwarg is not passed."""
+    captured = {}
+
+    class FakePipeline:
+        def transcribe(self, audio, **kwargs):
+            captured.update(kwargs)
+            return {"language": "en", "segments": []}
 
     tool = _tool(monkeypatch, FakePipeline())
     out = tool.transcribe("audio.wav", language="en", initial_prompt="BOXABL")
     assert out["language"] == "en"
-    assert calls == ["BOXABL", None]
+    assert "initial_prompt" not in captured
 
 
-def test_transcribe_job_normalises_the_prompt(monkeypatch):
+def test_transcribe_job_normalises_the_prompt(monkeypatch, tmp_path):
     """The job strips/limits initial_prompt before calling WhisperX."""
     import app.jobs.transcribe as tmod
 
@@ -73,13 +107,9 @@ def test_transcribe_job_normalises_the_prompt(monkeypatch):
     tj = tmod.TranscribeJob.__new__(tmod.TranscribeJob)
     tj.job = job
     tj.logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
-    tj.directory = SimpleNamespace(temp=__import__("pathlib").Path("/tmp/t1"),
-                                   output=__import__("pathlib").Path("/tmp/t1"),
-                                   input=__import__("pathlib").Path("/tmp/t1"),
-                                   root=__import__("pathlib").Path("/tmp/t1"))
-    monkeypatch.setattr(tmod.TranscribeJob, "_resolve_input",
-                        lambda self, p: __import__("pathlib").Path("/tmp/t1/x.mp4"))
-    (tj.directory.temp / "x.mp4").write_bytes(b"fake")  # exists → passes the check
+    tj.directory = SimpleNamespace(temp=tmp_path, output=tmp_path, input=tmp_path, root=tmp_path)
+    monkeypatch.setattr(tmod.TranscribeJob, "_resolve_input", lambda self, p: tmp_path / "x.mp4")
+    (tmp_path / "x.mp4").write_bytes(b"fake")  # exists → passes the check
     import app.tools.ffprobe as fp
     import app.tools.ffmpeg as ff
     tj.settings = SimpleNamespace(ffmpeg_path=None, ffprobe_path=None)  # constructs FFprobe/FFmpeg
