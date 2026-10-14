@@ -209,3 +209,19 @@ def test_watermark_enabled_without_source_fails(tmp_path):
                          "watermark": {"enabled": True}})
     with pytest.raises(ValueError):
         RenderJob(settings=_settings(tmp_path), job=job).execute()
+
+
+def test_decider_options_defaults_match_vps_contract():
+    from app.jobs.render import DEFAULT_DECIDER, decider_options
+
+    assert DEFAULT_DECIDER == {
+        "chunk_chars": 4000,
+        "candidates_per_chunk": 3,
+        "top_n": 8,
+        "overlap": 0.10,
+    }
+    assert decider_options({}) == DEFAULT_DECIDER
+    assert decider_options(None) == DEFAULT_DECIDER
+    assert decider_options({"decider": {"chunk_chars": 0, "top_n": 2}})["chunk_chars"] == 0
+    assert decider_options({"decider": {"top_n": 2}})["top_n"] == 2
+    assert decider_options({"decider": {"top_n": "nope"}})["top_n"] == 8
