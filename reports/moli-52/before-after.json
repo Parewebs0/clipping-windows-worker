@@ -1,0 +1,66 @@
+{
+  "asset": "synthetic speech (Windows SAPI) + stationary noise, muxed to mp4",
+  "window_seconds": [
+    0.4,
+    6.4
+  ],
+  "snr_db": {
+    "before_enhance": 7.9,
+    "after_deepfilter": 18.89
+  },
+  "lufs": {
+    "before_loudnorm_only": {
+      "integrated": -14.15,
+      "true_peak": 1.28
+    },
+    "after_enhance_then_loudnorm": {
+      "integrated": -14.44,
+      "true_peak": -0.82
+    },
+    "original_only": {
+      "integrated": -19.3,
+      "true_peak": -2.47
+    }
+  },
+  "enhance": {
+    "engine": "deepfilter",
+    "applied": true,
+    "strength": 1.0,
+    "device": "cuda",
+    "model": "DeepFilterNet3",
+    "atten_lim_db": null,
+    "sample_rate": 48000
+  },
+  "applied_after": {
+    "normalized": true,
+    "original_only": false,
+    "filter": "loudnorm",
+    "target_lufs": -14,
+    "true_peak_db": -1,
+    "lra": 11,
+    "mode": "linear",
+    "enhance": {
+      "engine": "deepfilter",
+      "applied": true,
+      "strength": 1.0,
+      "device": "cuda",
+      "model": "DeepFilterNet3",
+      "atten_lim_db": null,
+      "sample_rate": 48000
+    }
+  },
+  "applied_original_only": {
+    "normalized": false,
+    "original_only": true,
+    "filter": null,
+    "target_lufs": -14,
+    "true_peak_db": -1,
+    "reason": "audio.original_only",
+    "enhance": {
+      "engine": "deepfilter",
+      "applied": false,
+      "strength": 1.0,
+      "reason": "audio.original_only"
+    }
+  }
+}

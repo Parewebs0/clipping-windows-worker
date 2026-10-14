@@ -46,6 +46,7 @@ def logo_request(url: str, *, api_base_url: str, api_token: str) -> tuple[str, d
         headers["Authorization"] = f"Bearer {api_token}"
     return full, headers
 from app.tools.captions import write_ass
+from app.tools.enhance import enhance_decision, parse_enhance, run_enhance
 from app.tools.ffmpeg import FFmpegTool
 from app.tools.ffprobe import FFprobeTool
 
@@ -80,10 +81,13 @@ class RenderJob(BaseJob):
         # captions{enabled, file | segments, brand_dictionary, style}
         # watermark{enabled, file | url, position, width, start, end}
         # on_screen_text{enabled, items[{text, start, end, position}]}
-        # audio{original_only, normalize, target_lufs, true_peak_db}
+        # audio{original_only, normalize, target_lufs, true_peak_db,
+        #       enhance{engine: none|deepfilter|resemble, strength}}
         # Tiempos relativos al clip. `captions.file` / `watermark.file`
         # (contrato antiguo) siguen funcionando. `audio.original_only`
-        # deja la pista sin loudnorm.
+        # deja la pista sin enhance y sin loudnorm. `enhance.engine`
+        # por defecto es `none` (solo loudnorm, el comportamiento de siempre).
+        # El enhance, si se pide, corre ANTES de medir/aplicar loudnorm.
         duration = end - start
         width, height = (1080, 1920) if output_format == "9:16" else (1920, 1080)
         captions = payload.get("captions") or {}
@@ -146,13 +150,31 @@ class RenderJob(BaseJob):
         audio_payload = payload.get("audio") if isinstance(payload.get("audio"), dict) else {}
         original_only = bool(audio_payload.get("original_only"))
         has_audio = FFprobeTool(self.settings).get_audio_stream(source) is not None
+        enhance_cfg = parse_enhance(audio_payload.get("enhance"))
+        enhance_meta = enhance_decision(
+            enhance_cfg, original_only=original_only, has_audio=has_audio,
+        )
+        audio_input = None
+        if enhance_meta["reason"] is None:
+            raw_wav = self.directory.temp / "enhance_in.wav"
+            out_wav = self.directory.temp / "enhance_out.wav"
+            ffmpeg.extract_audio_segment(
+                source, raw_wav, start=start, duration=duration, sample_rate=48000,
+            )
+            info = run_enhance(
+                raw_wav, out_wav, engine=enhance_cfg["engine"], strength=enhance_cfg["strength"],
+            )
+            audio_input = out_wav
+            enhance_meta = info
+        # Medir loudnorm sobre el audio que de verdad se va a normalizar.
         audio_meta, audio_filter = ffmpeg.prepare_loudnorm(
-            source,
-            start=start,
+            audio_input or source,
+            start=0.0 if audio_input is not None else start,
             duration=duration,
             original_only=original_only,
             has_audio=has_audio,
         )
+        audio_meta["enhance"] = enhance_meta
         applied["audio"] = audio_meta
 
         self.logger.info(
@@ -174,6 +196,7 @@ class RenderJob(BaseJob):
             watermark=watermark,
             output_fps=output_fps,
             audio_filter=audio_filter,
+            audio_input=audio_input,
         )
 
         self.logger.info("clip rendered", output=str(output_path))

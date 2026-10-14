@@ -224,6 +224,7 @@ El VPS manda en el payload del job `render` (tiempos relativos al clip):
 - El logo se descarga a `jobs/<id>/input/logo.*` (PNG/JPG/WebP; SVG no) y se superpone con `overlay` (ventana `start`/`end` opcional).
 - Compatibilidad: `captions.file` (.srt/.ass) y `watermark.file` siguen funcionando.
 - El resultado añade `applied{captions,on_screen_text,watermark}` y `probe{width,height,fps,has_audio,duration,codec}` para el verificador post-render del VPS.
+- `audio.enhance` (`{engine: none|deepfilter|resemble, strength}`) corre **antes** del loudnorm a -14 LUFS. El defecto `none` no toca el audio. `audio.original_only` tampoco. DeepFilterNet 3 se instala con `requirements-enhance.txt` (sin bajar torch). Resemble Enhance es opcional: su rueda de PyPI fija torch 2.1.1.
 
 ## Estructura del proyecto
 
