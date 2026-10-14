@@ -9,6 +9,29 @@ from urllib.parse import urlparse
 from app.jobs.base import BaseJob
 
 RENDER_SPEC_VERSION = 3
+# MOLI-48: same keys as VPS `app/services/rules/render_spec.py`.
+# The worker does not clip-decide; these travel on the payload for one contract.
+DEFAULT_DECIDER = {
+    "chunk_chars": 4000,
+    "candidates_per_chunk": 3,
+    "top_n": 8,
+    "overlap": 0.10,
+}
+
+
+def decider_options(payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Read `decider.*` from the render payload. Missing keys keep the VPS defaults."""
+    raw = (payload or {}).get("decider") if isinstance(payload, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    out = dict(DEFAULT_DECIDER)
+    for key, default in DEFAULT_DECIDER.items():
+        if key not in raw:
+            continue
+        try:
+            out[key] = type(default)(raw[key])
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def logo_request(url: str, *, api_base_url: str, api_token: str) -> tuple[str, dict[str, str]]:
@@ -139,6 +162,7 @@ class RenderJob(BaseJob):
             end=end,
             format=output_format,
             output_fps=output_fps,
+            decider=decider_options(payload),
         )
         ffmpeg.render_clip(
             input_path=source,
