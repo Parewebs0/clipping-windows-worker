@@ -47,6 +47,7 @@ def logo_request(url: str, *, api_base_url: str, api_token: str) -> tuple[str, d
         headers["Authorization"] = f"Bearer {api_token}"
     return full, headers
 from app.tools.captions import write_ass
+from app.tools.enhance import enhance_decision, parse_enhance, run_enhance
 from app.tools.ffmpeg import FFmpegTool
 from app.tools.ffprobe import FFprobeTool
 from app.tools.reframe import ReframePlan, needs_source_size, output_size, plan_reframe
@@ -302,14 +303,36 @@ class RenderJob(BaseJob):
         ffmpeg = FFmpegTool(self.settings)
         audio_payload = payload.get("audio") if isinstance(payload.get("audio"), dict) else {}
         original_only = bool(audio_payload.get("original_only"))
+        enhance_cfg = parse_enhance(audio_payload.get("enhance"))
+        enhance_meta = enhance_decision(
+            enhance_cfg, original_only=original_only, has_audio=has_audio,
+        )
+        audio_input = None
+        # The enhanced wav is the full window. Cleanup concat does not consume it.
+        if enhance_meta["reason"] is None and keeps:
+            enhance_meta = dict(enhance_meta)
+            enhance_meta["reason"] = "cleanup_keeps"
+            enhance_meta["applied"] = False
+        elif enhance_meta["reason"] is None:
+            raw_wav = self.directory.temp / "enhance_in.wav"
+            out_wav = self.directory.temp / "enhance_out.wav"
+            ffmpeg.extract_audio_segment(
+                source, raw_wav, start=start, duration=duration, sample_rate=48000,
+            )
+            info = run_enhance(
+                raw_wav, out_wav, engine=enhance_cfg["engine"], strength=enhance_cfg["strength"],
+            )
+            audio_input = out_wav
+            enhance_meta = info
         audio_meta, audio_filter = ffmpeg.prepare_loudnorm(
-            source,
-            start=start,
-            duration=overlay_duration if keeps else duration,
+            audio_input or source,
+            start=0.0 if audio_input is not None else start,
+            duration=duration if audio_input is not None else (overlay_duration if keeps else duration),
             original_only=original_only,
             has_audio=has_audio,
-            keeps=keeps,
+            keeps=None if audio_input is not None else keeps,
         )
+        audio_meta["enhance"] = enhance_meta
         applied["audio"] = audio_meta
 
         reframe_cfg = payload.get("reframe") if isinstance(payload.get("reframe"), dict) else {}
@@ -408,6 +431,7 @@ class RenderJob(BaseJob):
             image_overlays=emoji_overlays or None,
             censor_beeps=censor_beeps,
             keeps=keeps,
+            audio_input=audio_input,
         )
         try:
             ffmpeg.render_clip(**clip_kwargs)
@@ -444,6 +468,7 @@ class RenderJob(BaseJob):
                 has_audio=has_audio,
                 keeps=None,
             )
+            audio_meta["enhance"] = enhance_meta
             applied["audio"] = audio_meta
             applied["cleanup"] = _cleanup_report(
                 _blank_cleanup(duration, "render_fallback", enabled=bool(cleanup_plan["enabled"])),

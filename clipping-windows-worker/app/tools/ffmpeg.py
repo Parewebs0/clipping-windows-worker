@@ -160,6 +160,42 @@ class FFmpegTool:
         )
         return output
 
+    def extract_audio_segment(
+        self,
+        input_path: str | Path,
+        output_path: str | Path,
+        *,
+        start: float,
+        duration: float,
+        sample_rate: int = 48000,
+        channels: int = 1,
+    ) -> Path:
+        """Extrae la ventana del clip a WAV PCM. Mismo ``-ss`` que el render."""
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        run_command(
+            [
+                self._binary,
+                "-y",
+                "-ss",
+                f"{start:.3f}",
+                "-i",
+                str(input_path),
+                "-t",
+                f"{max(0.0, duration):.3f}",
+                "-vn",
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                str(sample_rate),
+                "-ac",
+                str(channels),
+                str(output),
+            ],
+            timeout=600,
+        )
+        return output
+
     def prepare_loudnorm(
         self,
         input_path: str | Path,
@@ -282,6 +318,7 @@ class FFmpegTool:
         image_overlays: list[dict[str, Any]] | None = None,
         censor_beeps: list[dict[str, Any]] | None = None,
         keeps: list[tuple[float, float]] | None = None,
+        audio_input: str | Path | None = None,
     ) -> Path:
         """Renderiza un clip: trim + crop/scale + subtítulos + watermark + encode.
 
@@ -395,14 +432,22 @@ class FFmpegTool:
             str(input_path),
         ]
 
-        has_watermark = bool(watermark and watermark.get("enabled"))
+        # Enhanced wav (already trimmed to the window) occupies input 1.
+        audio_index: int | None = None
+        if audio_input is not None:
+            command += ["-i", str(audio_input)]
+            audio_index = 1
+        audio_src = f"{audio_index}:a" if audio_index is not None else "0:a"
 
+        has_watermark = bool(watermark and watermark.get("enabled"))
+        wm_index: int | None = None
         if has_watermark:
             # El overlay usa 2 entradas (vídeo + logo): requiere -filter_complex.
             wm_file = watermark.get("file")
             if not wm_file:
                 raise ValueError("watermark.file is required when watermark.enabled=true")
             command += ["-i", str(wm_file)]
+            wm_index = 2 if audio_index is not None else 1
 
         command += ["-t", f"{duration:.3f}"]
 
@@ -422,43 +467,52 @@ class FFmpegTool:
             if complex_body is not None:
                 video_chain = (
                     f"{complex_body};"
-                    f"[1:v]scale={width}:-1[wm];"
+                    f"[{wm_index}:v]scale={width}:-1[wm];"
                     f"{label}[wm]overlay={x}:{y}{enable}[vout]"
                 )
             else:
                 video_chain = (
                     f"[0:v]{','.join(vf_parts)}[vmain];"
-                    f"[1:v]scale={width}:-1[wm];"
+                    f"[{wm_index}:v]scale={width}:-1[wm];"
                     f"[vmain][wm]overlay={x}:{y}{enable}[vout]"
                 )
             if audio_filter:
                 command += [
                     "-filter_complex",
-                    f"{video_chain};[0:a]{audio_filter}[aout]",
+                    f"{video_chain};[{audio_src}]{audio_filter}[aout]",
                     "-map",
                     "[vout]",
                     "-map",
                     "[aout]",
                 ]
             else:
-                command += ["-filter_complex", video_chain]
-                # `0:a?`: no fallar si la fuente no tiene audio (el QA lo detecta).
-                command += ["-map", "[vout]", "-map", "0:a?"]
+                command += ["-filter_complex", video_chain, "-map", "[vout]"]
+                if audio_index is not None:
+                    command += ["-map", audio_src]
+                else:
+                    # `0:a?`: no fallar si la fuente no tiene audio (el QA lo detecta).
+                    command += ["-map", "0:a?"]
         elif complex_body is not None:
             if audio_filter:
                 command += [
                     "-filter_complex",
-                    f"{complex_body};[0:a]{audio_filter}[aout]",
+                    f"{complex_body};[{audio_src}]{audio_filter}[aout]",
                     "-map",
                     label,
                     "-map",
                     "[aout]",
                 ]
             else:
-                command += ["-filter_complex", complex_body, "-map", label, "-map", "0:a?"]
+                command += ["-filter_complex", complex_body, "-map", label]
+                if audio_index is not None:
+                    command += ["-map", audio_src]
+                else:
+                    command += ["-map", "0:a?"]
         else:
             # Sin watermark: simple filtergraph con -vf (1 entrada / 1 salida).
             command += ["-vf", ",".join(vf_parts)]
+            if audio_index is not None:
+                command += ["-map", "0:v", "-map", audio_src]
             if audio_filter:
                 command += ["-af", audio_filter]
 
@@ -496,6 +550,7 @@ class FFmpegTool:
             format=output_format,
             watermark=has_watermark,
             loudnorm=bool(audio_filter),
+            enhance=audio_input is not None,
             output_fps=output_fps,
         )
         run_command(command, timeout=3600, cwd=vfilter_cwd)
