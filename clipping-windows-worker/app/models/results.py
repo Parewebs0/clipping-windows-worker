@@ -43,6 +43,7 @@ class TranscriptWord(BaseModel):
     word: str
     start: float
     end: float
+    speaker: str | None = None
 
 
 class TranscriptResult(BaseModel):

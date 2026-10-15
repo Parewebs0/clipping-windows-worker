@@ -235,17 +235,23 @@ class WhisperXTool:
                 "text": (seg.get("text") or "").strip(),
                 "speaker": seg.get("speaker"),
             }
-            segments.append(segment)
-
+            segment_words: list[dict[str, Any]] = []
             for w in seg.get("words", []) or []:
                 word = {
                     "word": w.get("word", ""),
                     "start": float(w.get("start", 0.0) or 0.0),
                     "end": float(w.get("end", 0.0) or 0.0),
                 }
-                if w.get("speaker"):
-                    word["speaker"] = w.get("speaker")
+                # Only a speaker written on the word itself. A segment speaker
+                # must not be copied onto words that diarization left blank.
+                speaker = w.get("speaker")
+                if speaker:
+                    word["speaker"] = str(speaker)
+                segment_words.append(word)
                 words.append(word)
+            if segment_words:
+                segment["words"] = segment_words
+            segments.append(segment)
 
         # `duration` no siempre está a nivel top; se calcula de los segmentos.
         duration = result.get("duration")

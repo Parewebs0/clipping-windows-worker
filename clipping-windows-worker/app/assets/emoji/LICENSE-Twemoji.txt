@@ -1,0 +1,5 @@
+Twemoji PNGs (72x72) are from the Twemoji project, licensed under CC-BY 4.0.
+Copyright 2020 Twitter, Inc and other contributors.
+https://github.com/jdecked/twemoji
+Attribution: Twemoji by Twitter / jdecked.
+Bundled samples: 1f525, 1f389, 1f4af. Other codepoints are fetched from the same set at render time.
