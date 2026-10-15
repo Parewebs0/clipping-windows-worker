@@ -1,12 +1,59 @@
-"""Publish job — YouTube, Instagram, TikTok."""
+"""Publish job — YouTube, Instagram, TikTok.
+
+MOLI-53: per-platform copy payloads from the VPS (title/caption/hashtags),
+account selection (`payload.account` → per-account env credentials) and a
+`scheduled_at` guard — a live publish refuses to run before its UTC hour.
+Dry-run is never blocked by the schedule (it only moves the clip).
+"""
 from __future__ import annotations
 
+import os
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from app.jobs.base import BaseJob
 from app.services.publish_state import PublishStateStore
 from app.utils.clip_storage import ClipStorage, ClipStorageError
+
+
+def _account_env(settings, base_field: str, account_key: str) -> str:
+    """Credential for one account (MOLI-53).
+
+    `account_key` 'default' (or a key without an override) reads the legacy
+    single-account field, so old deployments work unchanged. Other keys read
+    ``<BASE_FIELD>_<KEY>`` from the environment, e.g.
+    ``INSTAGRAM_ACCESS_TOKEN_IG2`` for account key ``ig2``."""
+    key = re.sub(r"[^A-Za-z0-9]+", "_", str(account_key or "default")).strip("_").upper()
+    override = ""
+    if key and key != "DEFAULT":
+        override = (os.environ.get(f"{base_field.upper()}_{key}") or "").strip()
+    if override:
+        return override
+    return (getattr(settings, base_field, None) or "").strip()
+
+
+def _assert_past_scheduled_at(payload: dict) -> None:
+    """Live publishes must not run before their UTC hour (MOLI-53).
+
+    The VPS already holds the job back via ``available_at``; this is the belt
+    and braces on the worker (clock skew, a requeued job, manual runs)."""
+    raw = payload.get("scheduled_at")
+    if not raw:
+        return
+    try:
+        scheduled = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return
+    if scheduled.tzinfo is None:
+        scheduled = scheduled.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    if now < scheduled:
+        raise ValueError(
+            f"publish scheduled_at {scheduled.isoformat()} not reached (now {now.isoformat()}); "
+            "job must be claimed only after its UTC hour"
+        )
 
 
 class PublishJob(BaseJob):
@@ -29,6 +76,7 @@ class PublishJob(BaseJob):
             raise NotImplementedError(f"platform {platform} not implemented")
 
         if not dry_run:
+            _assert_past_scheduled_at(payload)
             # Idempotency: a previous attempt may have published already and then
             # failed (e.g. reporting the result). Never upload the same clip twice.
             store = PublishStateStore(self._publish_state_dir())
@@ -67,25 +115,35 @@ class PublishJob(BaseJob):
         elif platform == "instagram":
             from app.services.instagram_upload import upload_reel
 
+            account = str(payload.get("account") or "default")
             uploaded = upload_reel(
                 file_path=dest,
                 caption=str(caption),
-                access_token=getattr(self.settings, "instagram_access_token", None) or "",
-                ig_user_id=getattr(self.settings, "instagram_ig_user_id", None) or "",
+                access_token=_account_env(self.settings, "instagram_access_token", account),
+                ig_user_id=_account_env(self.settings, "instagram_ig_user_id", account),
             )
             post_url = uploaded["post_url"]
-            extra = {"media_id": uploaded.get("media_id")}
+            extra = {"media_id": uploaded.get("media_id"), "account": account}
         else:
             from app.services.tiktok_upload import upload_video
 
+            account = str(payload.get("account") or "default")
+            # MOLI-53: TikTok's post text IS the per-platform copy the VPS built
+            # (caption already carries mentions/FTC/hashtags, ≤2200). The old
+            # title-only path dropped the hashtags entirely.
+            tiktok_text = str(caption).strip() or str(title)
             uploaded = upload_video(
                 file_path=dest,
-                title=str(title)[:150],
-                access_token=getattr(self.settings, "tiktok_access_token", None) or "",
+                title=tiktok_text,
+                access_token=_account_env(self.settings, "tiktok_access_token", account),
                 privacy_level=getattr(self.settings, "tiktok_privacy", None) or "SELF_ONLY",
             )
             post_url = uploaded["post_url"]
-            extra = {"publish_id": uploaded.get("publish_id"), "privacy_level": uploaded.get("privacy_level")}
+            extra = {
+                "publish_id": uploaded.get("publish_id"),
+                "privacy_level": uploaded.get("privacy_level"),
+                "account": account,
+            }
 
         pub = {"platform": platform, "status": "posted", "post_url": post_url}
         pub.update(extra)
