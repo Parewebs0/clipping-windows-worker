@@ -242,7 +242,9 @@ class WhisperXTool:
                     "start": float(w.get("start", 0.0) or 0.0),
                     "end": float(w.get("end", 0.0) or 0.0),
                 }
-                speaker = w.get("speaker") or seg.get("speaker")
+                # Only a speaker written on the word itself. A segment speaker
+                # must not be copied onto words that diarization left blank.
+                speaker = w.get("speaker")
                 if speaker:
                     word["speaker"] = str(speaker)
                 segment_words.append(word)

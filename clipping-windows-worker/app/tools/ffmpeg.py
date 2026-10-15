@@ -245,9 +245,14 @@ class FFmpegTool:
         # drive colon (`C:\...`). Por ello se referencia el archivo por nombre
         # relativo y el proceso arranca con cwd en su carpeta.
         vfilter_cwd: str | None = filter_cwd
+        overlays = [ov for ov in (image_overlays or []) if ov.get("file")]
+        beeps = list(censor_beeps or [])
         if captions_file:
             cf = Path(captions_file)
-            subtitle = self._subtitle_filter(cf.name, fontsdir=fontsdir)
+            # Emoji/censor and reframe complex graphs embed this filter in
+            # -filter_complex, which parses escapes one extra time.
+            in_graph = complex_body is not None or bool(overlays or beeps)
+            subtitle = self._subtitle_filter(cf.name, fontsdir=fontsdir, graph=in_graph)
             if complex_body is not None:
                 complex_body = f"{complex_body};{label}{subtitle}[vcapped]"
                 label = "[vcapped]"
@@ -256,8 +261,6 @@ class FFmpegTool:
             if vfilter_cwd is None:
                 vfilter_cwd = str(cf.parent)
 
-        overlays = [ov for ov in (image_overlays or []) if ov.get("file")]
-        beeps = list(censor_beeps or [])
         if overlays or beeps:
             return self._render_with_extras(
                 input_path=input_path,
@@ -675,7 +678,12 @@ class FFmpegTool:
         return ";".join(parts)
 
     @staticmethod
-    def _subtitle_filter(path: str | Path, fontsdir: str | Path | None = None) -> str:
+    def _subtitle_filter(
+        path: str | Path,
+        fontsdir: str | Path | None = None,
+        *,
+        graph: bool = False,
+    ) -> str:
         """Elige el filtro de FFmpeg correcto según la extensión del archivo.
 
         - `.srt`  → filtro `subtitles` (libass lo convierte).
@@ -691,7 +699,12 @@ class FFmpegTool:
             # Por defecto (incluido .srt): usar el filtro subtitles.
             base = f"subtitles={FFmpegTool._escape_path(path)}"
         if fontsdir and ext in (".ass", ".ssa", ".srt"):
-            base += f":fontsdir={FFmpegTool._escape_path(str(fontsdir))}"
+            fonts = FFmpegTool._escape_path(str(fontsdir))
+            # filter_complex consumes one escape level before the ass filter
+            # reads fontsdir, so a Windows drive colon needs a second backslash.
+            if graph:
+                fonts = fonts.replace("\\", "\\\\")
+            base += f":fontsdir={fonts}"
         return base
 
     @staticmethod
