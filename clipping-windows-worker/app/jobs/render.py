@@ -50,6 +50,41 @@ from app.tools.captions import write_ass
 from app.tools.ffmpeg import FFmpegTool
 from app.tools.ffprobe import FFprobeTool
 from app.tools.reframe import ReframePlan, needs_source_size, output_size, plan_reframe
+from app.tools.speech_cleanup import (
+    cleanup_options,
+    keep_ranges,
+    plan_cleanup,
+    remap_items,
+    remap_segments,
+    remap_watermark,
+)
+from app.utils.subprocess import CommandError
+
+
+def _blank_cleanup(duration: float, reason: str, *, enabled: bool) -> dict[str, Any]:
+    """Cleanup report for a file that was not cut."""
+    return {
+        "enabled": enabled,
+        "applied": False,
+        "removed_seconds": 0.0,
+        "by_kind": {"fillers": 0.0, "pauses": 0.0, "bad_takes": 0.0},
+        "cuts": [],
+        "keeps": [],
+        "output_duration": round(max(0.0, duration), 3),
+        "reason": reason,
+    }
+
+
+def _cleanup_report(plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled": plan["enabled"],
+        "applied": plan["applied"],
+        "removed_seconds": plan["removed_seconds"],
+        "by_kind": plan["by_kind"],
+        "cuts": plan["cuts"],
+        "output_duration": plan["output_duration"],
+        "reason": plan["reason"],
+    }
 
 BRAND_MEDIA_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".mov")
 # Worker routes for intro/outro have no suffix (`/branding/intro`). The
@@ -110,34 +145,91 @@ class RenderJob(BaseJob):
         # audio{original_only, normalize, target_lufs, true_peak_db}
         # reframe{mode, layout, smoothing, sample_fps, speakers}
         #   mode=center + layout=single (o ausente) = crop centrado histórico.
+        # cleanup{fillers, max_pause_ms, bad_takes, filler_list}
+        #   Off by default. A planner or concat error falls back to one trim.
+        #   Cleanup-on uses its own concat graph and skips reframe filters.
         # Tiempos relativos al clip. `captions.file` / `watermark.file`
         # (contrato antiguo) siguen funcionando. `audio.original_only`
         # deja la pista sin loudnorm.
         duration = end - start
         width, height = output_size(output_format)
-        captions = payload.get("captions") or {}
-        on_screen_text = payload.get("on_screen_text") or {}
         branding = payload.get("branding") if isinstance(payload.get("branding"), dict) else {}
+        source_captions = dict(payload.get("captions") or {})
+        source_text = dict(payload.get("on_screen_text") or {})
+        source_watermark = dict(payload.get("watermark") or {})
+        captions = dict(source_captions)
+        on_screen_text = dict(source_text)
+        watermark = dict(source_watermark)
         applied: dict[str, Any] = {
             "captions": {"applied": False, "events": 0},
             "on_screen_text": {"applied": False, "texts": []},
             "watermark": {"applied": False},
             "branding": {"applied": False},
         }
+        has_audio = FFprobeTool(self.settings).get_audio_stream(source) is not None
+        language = payload.get("language")
+        options = cleanup_options(payload)
+        cleanup_enabled = bool(options["fillers"] or options["bad_takes"] or options["max_pause_ms"])
+        try:
+            cleanup_plan = plan_cleanup(
+                captions.get("segments") or [],
+                duration=duration,
+                options=options,
+                language=str(language) if language else None,
+            )
+            if cleanup_plan["applied"] and not has_audio:
+                cleanup_plan = _blank_cleanup(duration, "no_audio", enabled=bool(cleanup_plan["enabled"]))
+            keeps = keep_ranges(cleanup_plan)
+            overlay_duration = float(cleanup_plan["output_duration"]) if keeps else duration
+            if keeps:
+                captions["segments"] = remap_segments(captions.get("segments") or [], keeps)
+                if on_screen_text.get("items"):
+                    on_screen_text["items"] = remap_items(
+                        on_screen_text.get("items") or [],
+                        keeps,
+                        source_duration=duration,
+                    )
+                watermark = remap_watermark(watermark, keeps, source_duration=duration)
+        except Exception as exc:
+            self.logger.warning(
+                "speech cleanup plan failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            cleanup_plan = _blank_cleanup(duration, f"error:{type(exc).__name__}", enabled=cleanup_enabled)
+            keeps = None
+            overlay_duration = duration
+            captions = dict(source_captions)
+            on_screen_text = dict(source_text)
+            watermark = dict(source_watermark)
+        applied["cleanup"] = _cleanup_report(cleanup_plan)
+
         captions_file = None
-        wants_generated = (captions.get("enabled") and captions.get("segments")) or on_screen_text.get("enabled")
-        if captions.get("enabled") and captions.get("file") and not captions.get("segments"):
-            captions_file = self._resolve_input(captions["file"])
-            applied["captions"] = {"applied": True, "events": None, "file": str(captions_file)}
-            if on_screen_text.get("enabled"):
-                self.logger.warning("on_screen_text ignored: captions.file given (send segments instead)")
-        elif wants_generated:
-            ass_path = self.directory.output / "overlay.ass"
-            summary = write_ass(ass_path, width=width, height=height, captions=captions,
-                                on_screen_text=on_screen_text, duration=duration, branding=branding)
+        ass_path = self.directory.output / "overlay.ass"
+
+        def write_overlay(caps: dict[str, Any], text: dict[str, Any], span: float) -> None:
+            nonlocal captions_file
+            wants_generated = (caps.get("enabled") and caps.get("segments")) or text.get("enabled")
+            if caps.get("enabled") and caps.get("file") and not caps.get("segments"):
+                captions_file = self._resolve_input(caps["file"])
+                applied["captions"] = {"applied": True, "events": None, "file": str(captions_file)}
+                if text.get("enabled"):
+                    self.logger.warning("on_screen_text ignored: captions.file given (send segments instead)")
+                return
+            if not wants_generated:
+                captions_file = None
+                return
+            summary = write_ass(
+                ass_path, width=width, height=height, captions=caps,
+                on_screen_text=text, duration=span, branding=branding,
+            )
             applied.update(summary)
             if summary["captions"]["applied"] or summary["on_screen_text"]["applied"]:
                 captions_file = ass_path
+            else:
+                captions_file = None
+
+        write_overlay(captions, on_screen_text, overlay_duration)
 
         # Brand assets (MOLI-54): font for libass + intro/outro cards.
         fontsdir: Path | None = None
@@ -174,8 +266,7 @@ class RenderJob(BaseJob):
                     self.logger.warning("brand %s download failed; skipped", side, error=str(e))
             applied["branding"] = brand_meta
 
-        # Watermark / logo
-        watermark = dict(payload.get("watermark") or {})
+        # Watermark / logo. Times were already shifted when cleanup applied.
         if watermark.get("enabled"):
             if watermark.get("file"):
                 watermark["file"] = str(self._resolve_input(watermark["file"]))
@@ -211,13 +302,13 @@ class RenderJob(BaseJob):
         ffmpeg = FFmpegTool(self.settings)
         audio_payload = payload.get("audio") if isinstance(payload.get("audio"), dict) else {}
         original_only = bool(audio_payload.get("original_only"))
-        has_audio = FFprobeTool(self.settings).get_audio_stream(source) is not None
         audio_meta, audio_filter = ffmpeg.prepare_loudnorm(
             source,
             start=start,
-            duration=duration,
+            duration=overlay_duration if keeps else duration,
             original_only=original_only,
             has_audio=has_audio,
+            keeps=keeps,
         )
         applied["audio"] = audio_meta
 
@@ -288,10 +379,11 @@ class RenderJob(BaseJob):
             reframe=plan.metadata.get("mode"),
             reframe_layout=plan.metadata.get("layout"),
             decider=decider_options(payload),
+            cleanup_removed=cleanup_plan["removed_seconds"],
         )
         t_render = time.perf_counter()
         preset_fonts = self._stage_caption_font((applied.get("captions") or {}).get("font_file"))
-        emoji_overlays = self._emoji_overlays(applied, duration)
+        emoji_overlays = self._emoji_overlays(applied, overlay_duration)
         if isinstance(applied.get("captions"), dict):
             applied["captions"]["emoji_applied"] = len(emoji_overlays)
         censor_beeps = None
@@ -299,7 +391,7 @@ class RenderJob(BaseJob):
         if cap_applied.get("censor_beep") and has_audio and not original_only:
             censor_beeps = list(cap_applied.get("censor_spans") or [])
         libass_fonts = self._combine_fonts(fontsdir, preset_fonts)
-        ffmpeg.render_clip(
+        clip_kwargs = dict(
             input_path=source,
             output_path=output_path,
             start=start,
@@ -315,7 +407,52 @@ class RenderJob(BaseJob):
             filter_cwd=str(work_dir) if plan.command_files else None,
             image_overlays=emoji_overlays or None,
             censor_beeps=censor_beeps,
+            keeps=keeps,
         )
+        try:
+            ffmpeg.render_clip(**clip_kwargs)
+        except CommandError as exc:
+            if not keeps:
+                raise
+            self.logger.warning(
+                "speech cleanup render failed; using the full window",
+                error=str(exc),
+            )
+            keeps = None
+            overlay_duration = duration
+            captions = dict(source_captions)
+            on_screen_text = dict(source_text)
+            resolved_logo = watermark.get("file")
+            watermark = dict(source_watermark)
+            if resolved_logo:
+                watermark["file"] = resolved_logo
+            write_overlay(captions, on_screen_text, duration)
+            if watermark.get("enabled") and watermark.get("file"):
+                applied["watermark"] = {
+                    "applied": True,
+                    "position": watermark.get("position", "top_right"),
+                    "width": int(watermark.get("width", 180)),
+                    "start": watermark.get("start"),
+                    "end": watermark.get("end"),
+                    "source": watermark.get("url") or Path(str(watermark["file"])).name,
+                }
+            audio_meta, audio_filter = ffmpeg.prepare_loudnorm(
+                source,
+                start=start,
+                duration=duration,
+                original_only=original_only,
+                has_audio=has_audio,
+                keeps=None,
+            )
+            applied["audio"] = audio_meta
+            applied["cleanup"] = _cleanup_report(
+                _blank_cleanup(duration, "render_fallback", enabled=bool(cleanup_plan["enabled"])),
+            )
+            clip_kwargs["keeps"] = None
+            clip_kwargs["captions_file"] = captions_file
+            clip_kwargs["watermark"] = watermark
+            clip_kwargs["audio_filter"] = audio_filter
+            ffmpeg.render_clip(**clip_kwargs)
         plan.metadata["timings"]["render_s"] = round(time.perf_counter() - t_render, 3)
 
         # Brand cards (MOLI-54): prepend/append intro/outro only when present.
@@ -355,10 +492,18 @@ class RenderJob(BaseJob):
         self.logger.info("clip rendered", output=str(output_path))
         file_size = output_path.stat().st_size
         probe = self._probe(output_path)
-        applied["frame_checks"] = self._frame_checks(output_path, applied, payload, probe, watermark)
+        check_payload = payload
+        if keeps:
+            check_payload = dict(payload)
+            check_payload["captions"] = captions
+        applied["frame_checks"] = self._frame_checks(output_path, applied, check_payload, probe, watermark)
         # Duración real del clip generado (puede diferir ligeramente de
         # end-start por el redondeo a keyframe, o crecer con intro/outro).
+        # Cleanup on: the file is shorter, so store the probed length.
         # La usamos en el QA y la persistimos en VPS como `duration_seconds`.
+        if keeps:
+            probed = probe.get("duration")
+            duration_seconds = float(probed) if isinstance(probed, (int, float)) else overlay_duration
         return {
             # Canónico (VPS consume esto)
             "file_path": str(output_path),
