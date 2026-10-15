@@ -193,6 +193,7 @@ class FFmpegTool:
         video_filters: list[str] | None = None,
         video_complex: str | None = None,
         filter_cwd: str | None = None,
+        fontsdir: str | Path | None = None,
     ) -> Path:
         """Renderiza un clip: trim + crop/scale + subtítulos + watermark + encode.
 
@@ -244,7 +245,7 @@ class FFmpegTool:
         vfilter_cwd: str | None = filter_cwd
         if captions_file:
             cf = Path(captions_file)
-            subtitle = self._subtitle_filter(cf.name)
+            subtitle = self._subtitle_filter(cf.name, fontsdir=fontsdir)
             if complex_body is not None:
                 complex_body = f"{complex_body};{label}{subtitle}[vcapped]"
                 label = "[vcapped]"
@@ -372,6 +373,120 @@ class FFmpegTool:
         run_command(command, timeout=3600, cwd=vfilter_cwd)
         return output
 
+    def concat_clips(
+        self,
+        *,
+        head: str | Path | None = None,
+        body: str | Path,
+        tail: str | Path | None = None,
+        output_path: str | Path,
+        max_side_seconds: float = 10.0,
+    ) -> Path:
+        """Concatena intro + clip + outro (MOLI-54), re-codificando.
+
+        Cada tarjeta (vídeo o imagen) se recorta a `max_side_seconds`,
+        re-escala al tamaño del clip principal y compone una imagen en blanco
+        si no tiene pista de audio, para que las 2-3 partes compartan formato
+        exacto (`concat` demuxer + re-encode libx264/aac). Sin intro ni outro
+        no se re-codifica nada: se devuelve `body` tal cual.
+        """
+        body = Path(body)
+        head = Path(head) if head else None
+        tail = Path(tail) if tail else None
+        out = Path(output_path)
+        if not head and not tail:
+            return body
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        side_specs = [("head", head), ("tail", tail)]
+        # probe main size (needed to normalise cards to the same geometry)
+        w, h = self._video_size(body) or (1080, 1920)
+        head_norm = out.with_name("_brand_head.mp4")
+        tail_norm = out.with_name("_brand_tail.mp4")
+        for side, path in side_specs:
+            if path is None or not path.is_file():
+                continue
+            norm = out.with_name(f"_brand_{side}.mp4")
+            self._normalize_brand_card(path, norm, size=(w, h),
+                                       max_seconds=max_side_seconds)
+
+        # concat demuxer: file list (head, body, tail) then one encode pass
+        listing = out.with_name("_brand_concat.txt")
+        body_norm = body  # re-encode everything for uniformity
+        order: list[str] = []
+        if head and head.is_file():
+            order.append(f"file '{head_norm.as_posix()}'")
+        order.append(f"file '{body_norm.as_posix()}'")
+        if tail and tail.is_file():
+            order.append(f"file '{tail_norm.as_posix()}'")
+        listing.write_text("\n".join(order) + "\n", encoding="utf-8")
+
+        command = [
+            self._binary, "-y",
+            "-f", "concat", "-safe", "0", "-i", str(listing),
+            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(out),
+        ]
+        run_command(command, timeout=3600)
+        listing.unlink(missing_ok=True)
+        for tmp in (head_norm, tail_norm):
+            if tmp.exists():
+                tmp.unlink()
+        return out
+
+    def _video_size(self, path: str | Path) -> tuple[int, int] | None:
+        from app.tools.ffprobe import FFprobeTool
+
+        try:
+            data = FFprobeTool(self.settings).probe(str(path))
+        except Exception:  # noqa: BLE001
+            return None
+        for st in data.get("streams", []):
+            if st.get("width") and st.get("height"):
+                return int(st["width"]), int(st["height"])
+        return None
+
+    def _normalize_brand_card(
+        self,
+        src: str | Path,
+        dst: str | Path,
+        *,
+        size: tuple[int | None, int | None],
+        max_seconds: float,
+    ) -> Path:
+        """Vídeo o imagen → MP4 corto con el tamaño del clip principal.
+
+        Imagen: se mantiene fija `max_seconds` con una pista de audio muda
+        (`anullsrc`) para que el concat no diverja de las partes con sonido.
+        Vídeo: recortado a `max_seconds`; sin audio → pista muda.
+        """
+        src = Path(src)
+        dst = Path(dst)
+        w, h = size
+        scale = "" if not (w and h) else f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps=30,"
+        is_video = src.suffix.lower() in (".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v")
+        duration_arg = ["-t", f"{max(0.1, float(max_seconds)):.3f}"]
+        if is_video:
+            video_in = ["-ss", "0", "-i", str(src), *duration_arg]
+        else:
+            video_in = ["-loop", "1", "-i", str(src), *duration_arg]
+        command = [
+            self._binary, "-y",
+            *video_in,
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-t", f"{max(0.1, float(max_seconds)):.3f}",
+            "-vf", scale + "setsar=1",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-shortest",
+            str(dst),
+        ]
+        run_command(command, timeout=1200)
+        return dst
+
     @staticmethod
     def _position_xy(position: str, margin_x: int, margin_y: int) -> tuple[str, str]:
         """Devuelve (x, y) para el overlay según la posición y márgenes."""
@@ -388,17 +503,25 @@ class FFmpegTool:
         raise ValueError(f"Unsupported watermark position: {position}")
 
     @staticmethod
-    def _subtitle_filter(path: str | Path) -> str:
+    def _subtitle_filter(path: str | Path, fontsdir: str | Path | None = None) -> str:
         """Elige el filtro de FFmpeg correcto según la extensión del archivo.
 
         - `.srt`  → filtro `subtitles` (libass lo convierte).
         - `.ass`/`.ssa` → filtro `ass` (formatos estilizados avanzados).
+
+        `fontsdir` (MOLI-54): carpeta local del job con la fuente de marca
+        para libass (`fontsdir=...`). Es necesario porque el filtro no acepta
+        el `fontsdir` por command-line común.
         """
         ext = Path(path).suffix.lower()
         if ext in (".ass", ".ssa"):
-            return f"ass={FFmpegTool._escape_path(path)}"
-        # Por defecto (incluido .srt): usar el filtro subtitles.
-        return f"subtitles={FFmpegTool._escape_path(path)}"
+            base = f"ass={FFmpegTool._escape_path(path)}"
+        else:
+            # Por defecto (incluido .srt): usar el filtro subtitles.
+            base = f"subtitles={FFmpegTool._escape_path(path)}"
+        if fontsdir and ext in (".ass", ".ssa", ".srt"):
+            base += f":fontsdir={FFmpegTool._escape_path(str(fontsdir))}"
+        return base
 
     @staticmethod
     def _escape_path(path: str | Path) -> str:
