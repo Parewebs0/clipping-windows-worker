@@ -194,6 +194,12 @@ def test_loudnorm_hits_publish_target_unless_original_only(tmp_path):
         "target_lufs": -14,
         "true_peak_db": -1,
         "reason": "audio.original_only",
+        "enhance": {
+            "engine": "none",
+            "applied": False,
+            "strength": 1.0,
+            "reason": "audio.original_only",
+        },
     }
     norm_i, norm_tp = _integrated_loudness(Path(normalized["file_path"]))
     kept_i, _kept_tp = _integrated_loudness(Path(kept["file_path"]))

@@ -9,6 +9,10 @@ structlog>=24.1.0
 # Transcripción (GPU)
 whisperx>=3.8.0
 
+# Reframe (optional). mode=center does not import these.
+# mediapipe>=0.10.18          # Face Detector, Apache-2.0
+# ultralytics>=8.3.0          # YOLO11 + ByteTrack, AGPL-3.0 (internal use)
+
 # Descarga de vídeos
 yt-dlp>=2026.8.0
 
@@ -21,3 +25,7 @@ google-auth-httplib2>=0.2.0
 # Tests
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+
+# Speech enhancement (MOLI-52) is optional and lives in requirements-enhance.txt.
+# audio.enhance.engine defaults to "none", so a worker without those packages
+# keeps the current loudnorm-only render.

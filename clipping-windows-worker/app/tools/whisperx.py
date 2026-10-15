@@ -12,6 +12,7 @@ arrancar y reportar health incluso si WhisperX no está instalado.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Any
 
@@ -122,21 +123,50 @@ class WhisperXTool:
         *,
         language: str | None = None,
         diarization: bool = False,
+        initial_prompt: str | None = None,
     ) -> dict[str, Any]:
         """Transcribe un archivo de audio y devuelve un dict estructurado.
 
         El audio se pre-carga a numpy (16kHz mono) para evitar depender del
         decoding interno de whisperx (torchcodec), que puede estar roto.
+
+        `initial_prompt` (MOLI-54): vocabulario de marca para forzar
+        ortografía exacta de los términos de la marca en la transcripción.
+
+        whisperx 3.8.6 (`FasterWhisperPipeline.transcribe`) no acepta
+        `initial_prompt`. El prompt vive en `pipeline.options`
+        (`TranscriptionOptions`, dataclass). Se sustituye solo durante la
+        llamada y se restaura después, también si `transcribe` falla.
         """
         whisperx = self._ensure_import()
-        import numpy as np  # noqa: PLC0415
 
         pipeline = self._load_model(whisperx, language)
         device = self._resolved_device or self.settings.device
         audio = self._load_audio_numpy(audio_path)
 
-        logger.info("transcribing audio", audio=str(audio_path), device=device)
-        raw = pipeline.transcribe(audio, batch_size=16, language=language)
+        logger.info("transcribing audio", audio=str(audio_path), device=device,
+                    initial_prompt=bool(initial_prompt))
+        kwargs: dict[str, Any] = {"batch_size": 16, "language": language}
+        previous_options = None
+        if initial_prompt:
+            options = getattr(pipeline, "options", None)
+            if dataclasses.is_dataclass(options) and not isinstance(options, type):
+                try:
+                    pipeline.options = dataclasses.replace(options, initial_prompt=initial_prompt)
+                    previous_options = options
+                except TypeError:
+                    logger.warning(
+                        "whisperx options have no initial_prompt; transcribing without it",
+                    )
+            else:
+                logger.warning(
+                    "whisperx pipeline.options is not a dataclass; transcribing without initial_prompt",
+                )
+        try:
+            raw = pipeline.transcribe(audio, **kwargs)
+        finally:
+            if previous_options is not None:
+                pipeline.options = previous_options
         result = dict(raw) if not isinstance(raw, dict) else raw
 
         # El language detectado se conserva, porque `align` lo pierde.
@@ -167,13 +197,22 @@ class WhisperXTool:
             logger.warning("alignment failed; usando solo segmentos", error=str(exc))
 
         # --- Diarización de hablantes (tolerante a fallos) ---
+        # WhisperX 3.8: el pipeline recibe el audio (numpy), no el dict del
+        # transcript. assign_word_speakers escribe speaker en segmentos y palabras.
         if diarization:
             try:
-                from whisperx.diarize import DiarizationPipeline  # noqa: PLC0415
+                from whisperx.diarize import (  # noqa: PLC0415
+                    DiarizationPipeline,
+                    assign_word_speakers,
+                )
 
-                logger.info("running diarization")
-                diarize_model = DiarizationPipeline(device=device)
-                result = diarize_model(result)
+                token = getattr(self.settings, "hf_token", None)
+                logger.info("running diarization", device=device, token=bool(token))
+                # whisperx 3.8.6: DiarizationPipeline(model_name=None, token=None, device=..., cache_dir=None).
+                # pyannote 4 Pipeline.from_pretrained takes token=, not use_auth_token=.
+                diarize_model = DiarizationPipeline(device=device, token=token)
+                diarize_df = diarize_model(audio)
+                result = assign_word_speakers(diarize_df, result)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "diarization failed; continúo sin speakers", error=str(exc)
@@ -196,16 +235,23 @@ class WhisperXTool:
                 "text": (seg.get("text") or "").strip(),
                 "speaker": seg.get("speaker"),
             }
-            segments.append(segment)
-
+            segment_words: list[dict[str, Any]] = []
             for w in seg.get("words", []) or []:
-                words.append(
-                    {
-                        "word": w.get("word", ""),
-                        "start": float(w.get("start", 0.0) or 0.0),
-                        "end": float(w.get("end", 0.0) or 0.0),
-                    }
-                )
+                word = {
+                    "word": w.get("word", ""),
+                    "start": float(w.get("start", 0.0) or 0.0),
+                    "end": float(w.get("end", 0.0) or 0.0),
+                }
+                # Only a speaker written on the word itself. A segment speaker
+                # must not be copied onto words that diarization left blank.
+                speaker = w.get("speaker")
+                if speaker:
+                    word["speaker"] = str(speaker)
+                segment_words.append(word)
+                words.append(word)
+            if segment_words:
+                segment["words"] = segment_words
+            segments.append(segment)
 
         # `duration` no siempre está a nivel top; se calcula de los segmentos.
         duration = result.get("duration")

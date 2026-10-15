@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     render_output_fps: float = Field(default=30.0, gt=0.0)
     device: Literal["cuda", "cpu"] = "cuda"
     compute_type: str = "float16"
+    # Optional. Pyannote diarization needs a Hugging Face token for the
+    # gated speaker model. Empty means "try without one"; a failure is logged
+    # and the transcript keeps going without speaker labels.
+    hf_token: str | None = None
     allow_cpu_fallback: bool = False
     auto_cleanup: bool = True
     job_retention_hours: float = Field(default=24.0, ge=0.0)
@@ -73,6 +77,13 @@ class Settings(BaseSettings):
     @property
     def logs_dir(self) -> Path:
         return self.working_directory / "logs"
+
+    @field_validator("hf_token", mode="before")
+    @classmethod
+    def _empty_hf_token_is_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @field_validator("youtube_privacy", mode="before")
     @classmethod

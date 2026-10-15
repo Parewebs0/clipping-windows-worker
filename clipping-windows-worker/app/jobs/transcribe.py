@@ -24,6 +24,11 @@ class TranscribeJob(BaseJob):
         video_path = payload.get("video_path") or payload.get("video")
         language = payload.get("language", "auto")
         diarization = bool(payload.get("diarization", False))
+        # MOLI-54: vocabulario de marca como initial_prompt (ortografía exacta:
+        # "boxabl" → "BOXABL") sin condicionar las palabras.
+        initial_prompt = payload.get("initial_prompt") or None
+        if initial_prompt is not None:
+            initial_prompt = str(initial_prompt).strip()[:900] or None
 
         if not video_path:
             raise ValueError("payload.video_path or payload.video is required")
@@ -56,12 +61,14 @@ class TranscribeJob(BaseJob):
         audio_path = self.directory.temp / "audio.wav"
         ffmpeg.extract_audio(source, audio_path)
 
-        self.logger.info("starting whisperx", language=language, diarization=diarization)
+        self.logger.info("starting whisperx", language=language, diarization=diarization,
+                         initial_prompt=bool(initial_prompt))
         whisperx = WhisperXTool(self.settings)
         result = whisperx.transcribe(
             audio_path,
             language=None if language == "auto" else language,
             diarization=diarization,
+            initial_prompt=initial_prompt,
         )
 
         # Guardar transcript.json en el directorio de salida.
