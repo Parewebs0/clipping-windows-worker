@@ -1,0 +1,211 @@
+{
+  "source_duration": 11.185,
+  "window": [
+    0.0,
+    11.185
+  ],
+  "before_duration": 11.185,
+  "after_duration": 4.1,
+  "cleanup": {
+    "enabled": true,
+    "applied": true,
+    "removed_seconds": 7.182,
+    "by_kind": {
+      "fillers": 0.971,
+      "pauses": 3.53,
+      "bad_takes": 2.681
+    },
+    "cuts": [
+      {
+        "kind": "bad_take",
+        "start": 0.0,
+        "end": 2.681,
+        "seconds": 2.681,
+        "text": "Hoy vamos a hablar de casas"
+      },
+      {
+        "kind": "pause",
+        "start": 4.542,
+        "end": 6.435,
+        "seconds": 1.893
+      },
+      {
+        "kind": "filler",
+        "start": 6.435,
+        "end": 6.855,
+        "seconds": 0.42,
+        "text": "Eh"
+      },
+      {
+        "kind": "pause",
+        "start": 6.855,
+        "end": 7.664,
+        "seconds": 0.809
+      },
+      {
+        "kind": "filler",
+        "start": 7.664,
+        "end": 8.215,
+        "seconds": 0.551,
+        "text": "o sea"
+      },
+      {
+        "kind": "pause",
+        "start": 8.215,
+        "end": 9.043,
+        "seconds": 0.828
+      }
+    ],
+    "output_duration": 4.003,
+    "reason": null
+  },
+  "before_captions": "Hoy vamos a hablar de casas Hoy vamos a hablar de casas Eh o sea la casa se monta en un dia",
+  "after_captions": "Hoy vamos a hablar de casas la casa se monta en un dia",
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 2.274,
+      "text": "Hoy vamos a hablar de casas",
+      "words": [
+        {
+          "start": 0.137,
+          "end": 0.302,
+          "word": "Hoy"
+        },
+        {
+          "start": 0.357,
+          "end": 0.693,
+          "word": "vamos"
+        },
+        {
+          "start": 0.805,
+          "end": 0.855,
+          "word": "a"
+        },
+        {
+          "start": 0.874,
+          "end": 1.163,
+          "word": "hablar"
+        },
+        {
+          "start": 1.26,
+          "end": 1.38,
+          "word": "de"
+        },
+        {
+          "start": 1.418,
+          "end": 1.838,
+          "word": "casas"
+        }
+      ]
+    },
+    {
+      "start": 2.624,
+      "end": 4.898,
+      "text": "Hoy vamos a hablar de casas",
+      "words": [
+        {
+          "start": 2.761,
+          "end": 2.926,
+          "word": "Hoy"
+        },
+        {
+          "start": 2.981,
+          "end": 3.317,
+          "word": "vamos"
+        },
+        {
+          "start": 3.429,
+          "end": 3.479,
+          "word": "a"
+        },
+        {
+          "start": 3.498,
+          "end": 3.787,
+          "word": "hablar"
+        },
+        {
+          "start": 3.884,
+          "end": 4.004,
+          "word": "de"
+        },
+        {
+          "start": 4.042,
+          "end": 4.462,
+          "word": "casas"
+        }
+      ]
+    },
+    {
+      "start": 6.298,
+      "end": 7.327,
+      "text": "Eh",
+      "words": [
+        {
+          "start": 6.435,
+          "end": 6.855,
+          "word": "Eh"
+        }
+      ]
+    },
+    {
+      "start": 7.527,
+      "end": 8.806,
+      "text": "o sea",
+      "words": [
+        {
+          "start": 7.664,
+          "end": 7.765,
+          "word": "o"
+        },
+        {
+          "start": 7.795,
+          "end": 8.215,
+          "word": "sea"
+        }
+      ]
+    },
+    {
+      "start": 8.986,
+      "end": 11.185,
+      "text": "la casa se monta en un dia",
+      "words": [
+        {
+          "start": 9.123,
+          "end": 9.273,
+          "word": "la"
+        },
+        {
+          "start": 9.323,
+          "end": 9.608,
+          "word": "casa"
+        },
+        {
+          "start": 9.702,
+          "end": 9.842,
+          "word": "se"
+        },
+        {
+          "start": 9.888,
+          "end": 10.188,
+          "word": "monta"
+        },
+        {
+          "start": 10.287,
+          "end": 10.381,
+          "word": "en"
+        },
+        {
+          "start": 10.411,
+          "end": 10.546,
+          "word": "un"
+        },
+        {
+          "start": 10.59,
+          "end": 11.01,
+          "word": "dia"
+        }
+      ]
+    }
+  ]
+}
