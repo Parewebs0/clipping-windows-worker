@@ -197,13 +197,22 @@ class WhisperXTool:
             logger.warning("alignment failed; usando solo segmentos", error=str(exc))
 
         # --- Diarización de hablantes (tolerante a fallos) ---
+        # WhisperX 3.8: el pipeline recibe el audio (numpy), no el dict del
+        # transcript. assign_word_speakers escribe speaker en segmentos y palabras.
         if diarization:
             try:
-                from whisperx.diarize import DiarizationPipeline  # noqa: PLC0415
+                from whisperx.diarize import (  # noqa: PLC0415
+                    DiarizationPipeline,
+                    assign_word_speakers,
+                )
 
-                logger.info("running diarization")
-                diarize_model = DiarizationPipeline(device=device)
-                result = diarize_model(result)
+                token = getattr(self.settings, "hf_token", None)
+                logger.info("running diarization", device=device, token=bool(token))
+                # whisperx 3.8.6: DiarizationPipeline(model_name=None, token=None, device=..., cache_dir=None).
+                # pyannote 4 Pipeline.from_pretrained takes token=, not use_auth_token=.
+                diarize_model = DiarizationPipeline(device=device, token=token)
+                diarize_df = diarize_model(audio)
+                result = assign_word_speakers(diarize_df, result)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "diarization failed; continúo sin speakers", error=str(exc)
@@ -229,13 +238,14 @@ class WhisperXTool:
             segments.append(segment)
 
             for w in seg.get("words", []) or []:
-                words.append(
-                    {
-                        "word": w.get("word", ""),
-                        "start": float(w.get("start", 0.0) or 0.0),
-                        "end": float(w.get("end", 0.0) or 0.0),
-                    }
-                )
+                word = {
+                    "word": w.get("word", ""),
+                    "start": float(w.get("start", 0.0) or 0.0),
+                    "end": float(w.get("end", 0.0) or 0.0),
+                }
+                if w.get("speaker"):
+                    word["speaker"] = w.get("speaker")
+                words.append(word)
 
         # `duration` no siempre está a nivel top; se calcula de los segmentos.
         duration = result.get("duration")
