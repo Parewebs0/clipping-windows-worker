@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -48,6 +49,7 @@ def logo_request(url: str, *, api_base_url: str, api_token: str) -> tuple[str, d
 from app.tools.captions import write_ass
 from app.tools.ffmpeg import FFmpegTool
 from app.tools.ffprobe import FFprobeTool
+from app.tools.reframe import ReframePlan, needs_source_size, output_size, plan_reframe
 from app.tools.speech_cleanup import (
     cleanup_options,
     keep_ranges,
@@ -84,6 +86,31 @@ def _cleanup_report(plan: dict[str, Any]) -> dict[str, Any]:
         "reason": plan["reason"],
     }
 
+BRAND_MEDIA_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".mov")
+# Worker routes for intro/outro have no suffix (`/branding/intro`). The
+# VPS sets Content-Type from the stored file (video/mp4, image/png, …).
+_CONTENT_TYPE_SUFFIX = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/quicktime": ".mov",
+    "font/ttf": ".ttf",
+    "font/otf": ".otf",
+    "application/x-font-ttf": ".ttf",
+    "application/x-font-otf": ".otf",
+    "application/font-sfnt": ".ttf",
+    "application/vnd.ms-opentype": ".otf",
+}
+
+
+def suffix_for_content_type(content_type: str) -> str:
+    """File suffix for a Content-Type, or "" when the type is not a brand asset."""
+    media = (content_type or "").split(";", 1)[0].strip().lower()
+    return _CONTENT_TYPE_SUFFIX.get(media, "")
+
 
 class RenderJob(BaseJob):
     """Recorta, reencuadra, añade subtítulos y watermark, y codifica."""
@@ -116,18 +143,17 @@ class RenderJob(BaseJob):
         # watermark{enabled, file | url, position, width, start, end}
         # on_screen_text{enabled, items[{text, start, end, position}]}
         # audio{original_only, normalize, target_lufs, true_peak_db}
+        # reframe{mode, layout, smoothing, sample_fps, speakers}
+        #   mode=center + layout=single (o ausente) = crop centrado histórico.
         # cleanup{fillers, max_pause_ms, bad_takes, filler_list}
-        #   Off by default (fillers/bad_takes false, max_pause_ms null): the
-        #   clip is still one `-ss`/`-t` trim. When a flag is on, word times
-        #   drive trim/atrim + concat and subtitle times are shifted.
-        #   A planner error (reason=error:<Type>) or a concat CommandError
-        #   (reason=render_fallback) drops back to that single trim. The
-        #   file is the original window and applied stays false.
+        #   Off by default. A planner or concat error falls back to one trim.
+        #   Cleanup-on uses its own concat graph and skips reframe filters.
         # Tiempos relativos al clip. `captions.file` / `watermark.file`
         # (contrato antiguo) siguen funcionando. `audio.original_only`
         # deja la pista sin loudnorm.
         duration = end - start
-        width, height = (1080, 1920) if output_format == "9:16" else (1920, 1080)
+        width, height = output_size(output_format)
+        branding = payload.get("branding") if isinstance(payload.get("branding"), dict) else {}
         source_captions = dict(payload.get("captions") or {})
         source_text = dict(payload.get("on_screen_text") or {})
         source_watermark = dict(payload.get("watermark") or {})
@@ -138,22 +164,23 @@ class RenderJob(BaseJob):
             "captions": {"applied": False, "events": 0},
             "on_screen_text": {"applied": False, "texts": []},
             "watermark": {"applied": False},
+            "branding": {"applied": False},
         }
         has_audio = FFprobeTool(self.settings).get_audio_stream(source) is not None
         language = payload.get("language")
         options = cleanup_options(payload)
         cleanup_enabled = bool(options["fillers"] or options["bad_takes"] or options["max_pause_ms"])
         try:
-            plan = plan_cleanup(
+            cleanup_plan = plan_cleanup(
                 captions.get("segments") or [],
                 duration=duration,
                 options=options,
                 language=str(language) if language else None,
             )
-            if plan["applied"] and not has_audio:
-                plan = _blank_cleanup(duration, "no_audio", enabled=bool(plan["enabled"]))
-            keeps = keep_ranges(plan)
-            overlay_duration = float(plan["output_duration"]) if keeps else duration
+            if cleanup_plan["applied"] and not has_audio:
+                cleanup_plan = _blank_cleanup(duration, "no_audio", enabled=bool(cleanup_plan["enabled"]))
+            keeps = keep_ranges(cleanup_plan)
+            overlay_duration = float(cleanup_plan["output_duration"]) if keeps else duration
             if keeps:
                 captions["segments"] = remap_segments(captions.get("segments") or [], keeps)
                 if on_screen_text.get("items"):
@@ -169,13 +196,13 @@ class RenderJob(BaseJob):
                 error_type=type(exc).__name__,
                 error=str(exc),
             )
-            plan = _blank_cleanup(duration, f"error:{type(exc).__name__}", enabled=cleanup_enabled)
+            cleanup_plan = _blank_cleanup(duration, f"error:{type(exc).__name__}", enabled=cleanup_enabled)
             keeps = None
             overlay_duration = duration
             captions = dict(source_captions)
             on_screen_text = dict(source_text)
             watermark = dict(source_watermark)
-        applied["cleanup"] = _cleanup_report(plan)
+        applied["cleanup"] = _cleanup_report(cleanup_plan)
 
         captions_file = None
         ass_path = self.directory.output / "overlay.ass"
@@ -194,7 +221,7 @@ class RenderJob(BaseJob):
                 return
             summary = write_ass(
                 ass_path, width=width, height=height, captions=caps,
-                on_screen_text=text, duration=span,
+                on_screen_text=text, duration=span, branding=branding,
             )
             applied.update(summary)
             if summary["captions"]["applied"] or summary["on_screen_text"]["applied"]:
@@ -203,6 +230,41 @@ class RenderJob(BaseJob):
                 captions_file = None
 
         write_overlay(captions, on_screen_text, overlay_duration)
+
+        # Brand assets (MOLI-54): font for libass + intro/outro cards.
+        fontsdir: Path | None = None
+        brand_head: Path | None = None
+        brand_tail: Path | None = None
+        brand_meta = {"applied": False}
+        if branding:
+            font_url = branding.get("font_url") or ""
+            if font_url:
+                try:
+                    font_path = self._download_brand(font_url, ("font", ".ttf"))
+                    fontsdir = font_path.parent
+                    # libass needs the exact family; keep the file for the fontsdir
+                    # and record it for applied metadata
+                    font_ref = font_path.name
+                    brand_meta["font"] = font_ref
+                    brand_meta["applied"] = True
+                except Exception as e:  # noqa: BLE001
+                    self.logger.warning("brand font download failed; default font kept", error=str(e))
+            for side, key in (("intro", "intro"), ("outro", "outro")):
+                piece = branding.get(key) or {}
+                url = piece.get("url") or ""
+                if not url:
+                    continue
+                try:
+                    path = self._download_brand(url, (side,))
+                    if side == "intro":
+                        brand_head = path
+                    else:
+                        brand_tail = path
+                    brand_meta.setdefault("cards", []).append(side)
+                    brand_meta["applied"] = True
+                except Exception as e:  # noqa: BLE001 - a broken asset never blocks the render
+                    self.logger.warning("brand %s download failed; skipped", side, error=str(e))
+            applied["branding"] = brand_meta
 
         # Watermark / logo. Times were already shifted when cleanup applied.
         if watermark.get("enabled"):
@@ -250,6 +312,63 @@ class RenderJob(BaseJob):
         )
         applied["audio"] = audio_meta
 
+        reframe_cfg = payload.get("reframe") if isinstance(payload.get("reframe"), dict) else {}
+        if not reframe_cfg.get("speakers"):
+            reframe_cfg = dict(reframe_cfg)
+            speakers = []
+            for seg in captions.get("segments") or []:
+                if not isinstance(seg, dict) or not seg.get("speaker"):
+                    continue
+                try:
+                    speakers.append({
+                        "start": float(seg.get("start") or 0),
+                        "end": float(seg.get("end") or 0),
+                        "speaker": str(seg["speaker"]),
+                    })
+                except (TypeError, ValueError):
+                    continue
+            if speakers:
+                reframe_cfg["speakers"] = speakers
+        work_dir = captions_file.parent if captions_file else self.directory.output
+        src_w, src_h = (0, 0)
+        if needs_source_size(reframe_cfg, output_format):
+            resolution = FFprobeTool(self.settings).get_resolution(source)
+            if resolution:
+                src_w, src_h = resolution
+        t_plan = time.perf_counter()
+        try:
+            plan = plan_reframe(
+                input_path=source,
+                start=start,
+                end=end,
+                output_format=output_format,
+                reframe=reframe_cfg,
+                src_w=src_w,
+                src_h=src_h,
+                output_fps=output_fps,
+                work_dir=work_dir,
+                ffmpeg_bin=self.settings.ffmpeg_path or "ffmpeg",
+                model_dir=Path(self.settings.working_directory) / "models",
+            )
+        except Exception as exc:  # noqa: BLE001 — a bad plan must not drop the clip
+            self.logger.warning("reframe plan failed; using center crop", error=str(exc))
+            plan = ReframePlan(
+                True,
+                None,
+                None,
+                {
+                    "mode": "center",
+                    "layout": "single",
+                    "legacy": True,
+                    "fallback": "error",
+                    "timings": {},
+                },
+                [],
+            )
+        plan.metadata.setdefault("timings", {})
+        plan.metadata["timings"]["plan_s"] = round(time.perf_counter() - t_plan, 3)
+        applied["reframe"] = plan.metadata
+
         self.logger.info(
             "rendering clip",
             input=str(source),
@@ -257,9 +376,21 @@ class RenderJob(BaseJob):
             end=end,
             format=output_format,
             output_fps=output_fps,
+            reframe=plan.metadata.get("mode"),
+            reframe_layout=plan.metadata.get("layout"),
             decider=decider_options(payload),
-            cleanup_removed=plan["removed_seconds"],
+            cleanup_removed=cleanup_plan["removed_seconds"],
         )
+        t_render = time.perf_counter()
+        preset_fonts = self._stage_caption_font((applied.get("captions") or {}).get("font_file"))
+        emoji_overlays = self._emoji_overlays(applied, overlay_duration)
+        if isinstance(applied.get("captions"), dict):
+            applied["captions"]["emoji_applied"] = len(emoji_overlays)
+        censor_beeps = None
+        cap_applied = applied.get("captions") or {}
+        if cap_applied.get("censor_beep") and has_audio and not original_only:
+            censor_beeps = list(cap_applied.get("censor_spans") or [])
+        libass_fonts = self._combine_fonts(fontsdir, preset_fonts)
         clip_kwargs = dict(
             input_path=source,
             output_path=output_path,
@@ -270,6 +401,12 @@ class RenderJob(BaseJob):
             watermark=watermark,
             output_fps=output_fps,
             audio_filter=audio_filter,
+            fontsdir=libass_fonts,
+            video_filters=plan.vf,
+            video_complex=plan.complex_graph,
+            filter_cwd=str(work_dir) if plan.command_files else None,
+            image_overlays=emoji_overlays or None,
+            censor_beeps=censor_beeps,
             keeps=keeps,
         )
         try:
@@ -309,20 +446,48 @@ class RenderJob(BaseJob):
             )
             applied["audio"] = audio_meta
             applied["cleanup"] = _cleanup_report(
-                _blank_cleanup(duration, "render_fallback", enabled=bool(plan["enabled"])),
+                _blank_cleanup(duration, "render_fallback", enabled=bool(cleanup_plan["enabled"])),
             )
-            ffmpeg.render_clip(
-                input_path=source,
-                output_path=output_path,
-                start=start,
-                end=end,
-                output_format=output_format,
-                captions_file=captions_file,
-                watermark=watermark,
-                output_fps=output_fps,
-                audio_filter=audio_filter,
-                keeps=None,
-            )
+            clip_kwargs["keeps"] = None
+            clip_kwargs["captions_file"] = captions_file
+            clip_kwargs["watermark"] = watermark
+            clip_kwargs["audio_filter"] = audio_filter
+            ffmpeg.render_clip(**clip_kwargs)
+        plan.metadata["timings"]["render_s"] = round(time.perf_counter() - t_render, 3)
+
+        # Brand cards (MOLI-54): prepend/append intro/outro only when present.
+        # Concat is a full re-encode of head/body/tail; body keeps its own
+        # resolution and cards are normalised to it. This inflates duration —
+        # the QA duration window must allow it (render payload `qa_duration`).
+        if brand_head is not None or brand_tail is not None:
+            cap_seconds = float(branding.get("max_card_seconds") or 10.0)
+            intro_secs = float((branding.get("intro") or {}).get("max_seconds") or 1.5)
+            outro_secs = float((branding.get("outro") or {}).get("max_seconds") or 1.5)
+            head_cap = max(0.1, min(cap_seconds, intro_secs))
+            tail_cap = max(0.1, min(cap_seconds, outro_secs))
+            if brand_head is None:
+                head_cap = 0.0
+            if brand_tail is None:
+                tail_cap = 0.0
+            joined = output_path.with_name(f"_branded_{output_path.name}")
+            try:
+                ffmpeg.concat_clips(head=brand_head if head_cap else None,
+                                    body=output_path,
+                                    tail=brand_tail if tail_cap else None,
+                                    output_path=joined,
+                                    max_side_seconds=max(head_cap, tail_cap))
+                joined.replace(output_path)
+                duration_seconds = max(0.0, (end - start) + head_cap + tail_cap)
+            except Exception as e:  # noqa: BLE001 - a failed concat must not drop the clip
+                self.logger.warning(
+                    "brand card concat failed; keeping clip without cards", error=str(e),
+                )
+                brand_meta["cards_error"] = str(e)[:500]
+                if joined.exists():
+                    joined.unlink()
+                duration_seconds = max(0.0, end - start)
+        else:
+            duration_seconds = max(0.0, end - start)
 
         self.logger.info("clip rendered", output=str(output_path))
         file_size = output_path.stat().st_size
@@ -333,11 +498,9 @@ class RenderJob(BaseJob):
             check_payload["captions"] = captions
         applied["frame_checks"] = self._frame_checks(output_path, applied, check_payload, probe, watermark)
         # Duración real del clip generado (puede diferir ligeramente de
-        # end-start por el redondeo a keyframe). La usamos en el QA y
-        # la persistimos en VPS como `duration_seconds`.
-        # Cleanup off: keep end-start. Cleanup on: the file is shorter, so
-        # store the probed length QA will measure.
-        duration_seconds = max(0.0, end - start)
+        # end-start por el redondeo a keyframe, o crecer con intro/outro).
+        # Cleanup on: the file is shorter, so store the probed length.
+        # La usamos en el QA y la persistimos en VPS como `duration_seconds`.
         if keeps:
             probed = probe.get("duration")
             duration_seconds = float(probed) if isinstance(probed, (int, float)) else overlay_duration
@@ -378,6 +541,102 @@ class RenderJob(BaseJob):
                 raise ValueError(f"logo URL is not a raster image ({ctype or 'unknown'}): {url}")
             dest.write_bytes(r.content)
         return dest
+
+    def _download_brand(self, url: str, name_hint: tuple[str, ...]) -> Path:
+        """Descarga un asset de marca (fuente TTF/OTF o tarjeta intro/outro).
+
+        Intro/outro se sirven en `/worker/campaigns/{id}/branding/{side}` sin
+        extensión. Sin sufijo el fichero caía en `.bin` y un MP4 se concatenaba
+        como imagen fija. La extensión sale de la URL si es un tipo conocido y,
+        si no, del Content-Type (`video/mp4`, `image/png`, …).
+        """
+        import httpx
+
+        full, headers = logo_request(
+            url, api_base_url=self.settings.api_base_url, api_token=self.settings.api_token,
+        )
+        url_suffix = Path(urlparse(full).path).suffix.lower()
+        if url_suffix not in (".ttf", ".otf", ".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".mov"):
+            url_suffix = ""
+        with httpx.Client(follow_redirects=True, timeout=120) as client:
+            r = client.get(full, headers=headers)
+            r.raise_for_status()
+            data = r.content
+            content_type = r.headers.get("content-type", "")
+        if not data:
+            raise ValueError(f"brand asset is empty: {url}")
+        base = name_hint[0] if name_hint else "brand"
+        ext = url_suffix or suffix_for_content_type(content_type)
+        if not ext and len(name_hint) > 1:
+            ext = name_hint[1]
+        if not ext:
+            ext = ".bin"
+        dest = self.directory.input / f"{base}{ext}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        return dest
+
+    def _stage_caption_font(self, filename: str | None) -> str | None:
+        """Copy a shipped OFL font next to the ASS file. Returns the relative fontsdir."""
+        if not filename:
+            return None
+        src = Path(__file__).resolve().parent.parent / "assets" / "fonts" / filename
+        if not src.is_file():
+            self.logger.warning("caption font missing", font=filename)
+            return None
+        dest_dir = self.directory.output / "fonts"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src.name
+        if not dest.is_file() or dest.stat().st_size != src.stat().st_size:
+            dest.write_bytes(src.read_bytes())
+        return "fonts"
+
+    def _combine_fonts(self, brand_dir: Path | None, preset_rel: str | None) -> str | None:
+        """One libass fontsdir for the brand download and/or the preset file."""
+        staged = self.directory.output / "fonts"
+        has_preset = bool(preset_rel) and staged.is_dir() and any(staged.iterdir())
+        copied = False
+        if brand_dir is not None and Path(brand_dir).is_dir():
+            for font in Path(brand_dir).iterdir():
+                if font.suffix.lower() not in {".ttf", ".otf", ".ttc"}:
+                    continue
+                staged.mkdir(parents=True, exist_ok=True)
+                dest = staged / font.name
+                if not dest.is_file() or dest.stat().st_size != font.stat().st_size:
+                    dest.write_bytes(font.read_bytes())
+                copied = True
+        if has_preset or copied:
+            return str(staged.resolve())
+        if brand_dir is not None:
+            return str(brand_dir)
+        return None
+
+    def _emoji_overlays(self, applied: dict, duration: float) -> list[dict[str, Any]]:
+        cues = list((applied.get("captions") or {}).get("emoji_cues") or [])
+        if not cues:
+            return []
+        from app.tools.emoji_png import resolve_emoji_png
+
+        cache = self.directory.output / "emoji"
+        ready: list[tuple[dict[str, Any], Path]] = []
+        for cue in cues:
+            png = resolve_emoji_png(str(cue.get("emoji") or ""), cache)
+            if png is None:
+                self.logger.warning("emoji png missing", emoji=cue.get("emoji"))
+                continue
+            ready.append((cue, png))
+        count = len(ready)
+        return [
+            {
+                "file": str(png),
+                "start": cue.get("start") or 0.0,
+                "end": cue.get("end") if cue.get("end") is not None else duration,
+                "width": 150,
+                "slot": slot,
+                "count": count,
+            }
+            for slot, (cue, png) in enumerate(ready)
+        ]
 
     def _frame_checks(self, video: Path, applied: dict, payload: dict, probe: dict, watermark: dict) -> dict[str, Any]:
         """Sample the rendered clip. Missing samples omit the bool so the VPS keeps metadata-only."""
