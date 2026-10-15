@@ -50,6 +50,8 @@ worker_run.log
 # MOLI-50: the reframe before/after pair is part of the PR.
 !docs/reframe/before.mp4
 !docs/reframe/after.mp4
+# MOLI-55: the before/after pair attached to the PR is the exception.
+!reports/moli-55/*.mp4
 *.mov
 *.mkv
 *.avi

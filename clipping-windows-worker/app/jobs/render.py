@@ -392,6 +392,22 @@ class RenderJob(BaseJob):
         plan.metadata["timings"]["plan_s"] = round(time.perf_counter() - t_plan, 3)
         applied["reframe"] = plan.metadata
 
+        from app.tools.production import features_requested, prepare_production
+
+        production = None
+        if features_requested(payload):
+            production = prepare_production(
+                payload,
+                duration=duration,
+                original_only=original_only,
+                work_dir=self.directory.input,
+                binary=ffmpeg._binary,
+                pexels_key=self.settings.pexels_api_key,
+                pixabay_key=self.settings.pixabay_api_key,
+                has_speech=has_audio,
+            )
+            applied.update(production["applied"])
+
         self.logger.info(
             "rendering clip",
             input=str(source),
@@ -405,79 +421,99 @@ class RenderJob(BaseJob):
             cleanup_removed=cleanup_plan["removed_seconds"],
         )
         t_render = time.perf_counter()
-        preset_fonts = self._stage_caption_font((applied.get("captions") or {}).get("font_file"))
-        emoji_overlays = self._emoji_overlays(applied, overlay_duration)
-        if isinstance(applied.get("captions"), dict):
-            applied["captions"]["emoji_applied"] = len(emoji_overlays)
-        censor_beeps = None
-        cap_applied = applied.get("captions") or {}
-        if cap_applied.get("censor_beep") and has_audio and not original_only:
-            censor_beeps = list(cap_applied.get("censor_spans") or [])
-        libass_fonts = self._combine_fonts(fontsdir, preset_fonts)
-        clip_kwargs = dict(
-            input_path=source,
-            output_path=output_path,
-            start=start,
-            end=end,
-            output_format=output_format,
-            captions_file=captions_file,
-            watermark=watermark,
-            output_fps=output_fps,
-            audio_filter=audio_filter,
-            fontsdir=libass_fonts,
-            video_filters=plan.vf,
-            video_complex=plan.complex_graph,
-            filter_cwd=str(work_dir) if plan.command_files else None,
-            image_overlays=emoji_overlays or None,
-            censor_beeps=censor_beeps,
-            keeps=keeps,
-            audio_input=audio_input,
-        )
-        try:
-            ffmpeg.render_clip(**clip_kwargs)
-        except CommandError as exc:
-            if not keeps:
-                raise
-            self.logger.warning(
-                "speech cleanup render failed; using the full window",
-                error=str(exc),
-            )
-            keeps = None
-            overlay_duration = duration
-            captions = dict(source_captions)
-            on_screen_text = dict(source_text)
-            resolved_logo = watermark.get("file")
-            watermark = dict(source_watermark)
-            if resolved_logo:
-                watermark["file"] = resolved_logo
-            write_overlay(captions, on_screen_text, duration)
-            if watermark.get("enabled") and watermark.get("file"):
-                applied["watermark"] = {
-                    "applied": True,
-                    "position": watermark.get("position", "top_right"),
-                    "width": int(watermark.get("width", 180)),
-                    "start": watermark.get("start"),
-                    "end": watermark.get("end"),
-                    "source": watermark.get("url") or Path(str(watermark["file"])).name,
-                }
-            audio_meta, audio_filter = ffmpeg.prepare_loudnorm(
-                source,
+        if production and production.get("use_graph"):
+            # Separate encode. Reframe, cleanup keeps, enhance wav, and emoji
+            # extras stay on the default path (those features off).
+            ffmpeg.render_production(
+                source=str(source),
+                output_path=str(output_path),
                 start=start,
                 duration=duration,
-                original_only=original_only,
-                has_audio=has_audio,
-                keeps=None,
+                output_format=output_format,
+                output_fps=output_fps,
+                captions_file=str(captions_file) if captions_file else None,
+                watermark=watermark if watermark.get("enabled") else None,
+                broll=production["broll"],
+                music=production["music"],
+                sfx=production["sfx"],
+                transitions=production["transitions"],
+                audio_filter=audio_filter,
+                has_speech=has_audio,
             )
-            audio_meta["enhance"] = enhance_meta
-            applied["audio"] = audio_meta
-            applied["cleanup"] = _cleanup_report(
-                _blank_cleanup(duration, "render_fallback", enabled=bool(cleanup_plan["enabled"])),
+        else:
+            preset_fonts = self._stage_caption_font((applied.get("captions") or {}).get("font_file"))
+            emoji_overlays = self._emoji_overlays(applied, overlay_duration)
+            if isinstance(applied.get("captions"), dict):
+                applied["captions"]["emoji_applied"] = len(emoji_overlays)
+            censor_beeps = None
+            cap_applied = applied.get("captions") or {}
+            if cap_applied.get("censor_beep") and has_audio and not original_only:
+                censor_beeps = list(cap_applied.get("censor_spans") or [])
+            libass_fonts = self._combine_fonts(fontsdir, preset_fonts)
+            clip_kwargs = dict(
+                input_path=source,
+                output_path=output_path,
+                start=start,
+                end=end,
+                output_format=output_format,
+                captions_file=captions_file,
+                watermark=watermark,
+                output_fps=output_fps,
+                audio_filter=audio_filter,
+                fontsdir=libass_fonts,
+                video_filters=plan.vf,
+                video_complex=plan.complex_graph,
+                filter_cwd=str(work_dir) if plan.command_files else None,
+                image_overlays=emoji_overlays or None,
+                censor_beeps=censor_beeps,
+                keeps=keeps,
+                audio_input=audio_input,
             )
-            clip_kwargs["keeps"] = None
-            clip_kwargs["captions_file"] = captions_file
-            clip_kwargs["watermark"] = watermark
-            clip_kwargs["audio_filter"] = audio_filter
-            ffmpeg.render_clip(**clip_kwargs)
+            try:
+                ffmpeg.render_clip(**clip_kwargs)
+            except CommandError as exc:
+                if not keeps:
+                    raise
+                self.logger.warning(
+                    "speech cleanup render failed; using the full window",
+                    error=str(exc),
+                )
+                keeps = None
+                overlay_duration = duration
+                captions = dict(source_captions)
+                on_screen_text = dict(source_text)
+                resolved_logo = watermark.get("file")
+                watermark = dict(source_watermark)
+                if resolved_logo:
+                    watermark["file"] = resolved_logo
+                write_overlay(captions, on_screen_text, duration)
+                if watermark.get("enabled") and watermark.get("file"):
+                    applied["watermark"] = {
+                        "applied": True,
+                        "position": watermark.get("position", "top_right"),
+                        "width": int(watermark.get("width", 180)),
+                        "start": watermark.get("start"),
+                        "end": watermark.get("end"),
+                        "source": watermark.get("url") or Path(str(watermark["file"])).name,
+                    }
+                audio_meta, audio_filter = ffmpeg.prepare_loudnorm(
+                    source,
+                    start=start,
+                    duration=duration,
+                    original_only=original_only,
+                    has_audio=has_audio,
+                    keeps=None,
+                )
+                audio_meta["enhance"] = enhance_meta
+                applied["audio"] = audio_meta
+                applied["cleanup"] = _cleanup_report(
+                    _blank_cleanup(duration, "render_fallback", enabled=bool(cleanup_plan["enabled"])),
+                )
+                clip_kwargs["keeps"] = None
+                clip_kwargs["captions_file"] = captions_file
+                clip_kwargs["watermark"] = watermark
+                clip_kwargs["audio_filter"] = audio_filter
+                ffmpeg.render_clip(**clip_kwargs)
         plan.metadata["timings"]["render_s"] = round(time.perf_counter() - t_render, 3)
 
         # Brand cards (MOLI-54): prepend/append intro/outro only when present.

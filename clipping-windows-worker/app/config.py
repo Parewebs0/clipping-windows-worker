@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     gog_path: str | None = None
     gog_account: str | None = None
     gog_keyring_password: str | None = None
+    pexels_api_key: str | None = None
+    pixabay_api_key: str | None = None
     youtube_client_id: str | None = None
     youtube_client_secret: str | None = None
     youtube_refresh_token: str | None = None
