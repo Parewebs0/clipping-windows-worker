@@ -190,10 +190,12 @@ class FFmpegTool:
         watermark: dict[str, Any] | None = None,
         output_fps: float = 30.0,
         audio_filter: str | None = None,
+        fontsdir: str | Path | None = None,
         video_filters: list[str] | None = None,
         video_complex: str | None = None,
         filter_cwd: str | None = None,
-        fontsdir: str | Path | None = None,
+        image_overlays: list[dict[str, Any]] | None = None,
+        censor_beeps: list[dict[str, Any]] | None = None,
     ) -> Path:
         """Renderiza un clip: trim + crop/scale + subtítulos + watermark + encode.
 
@@ -253,6 +255,25 @@ class FFmpegTool:
                 vf_parts.append(subtitle)
             if vfilter_cwd is None:
                 vfilter_cwd = str(cf.parent)
+
+        overlays = [ov for ov in (image_overlays or []) if ov.get("file")]
+        beeps = list(censor_beeps or [])
+        if overlays or beeps:
+            return self._render_with_extras(
+                input_path=input_path,
+                output=output,
+                start=start,
+                duration=duration,
+                vf_parts=vf_parts,
+                vfilter_cwd=vfilter_cwd,
+                watermark=watermark,
+                output_fps=output_fps,
+                audio_filter=audio_filter,
+                overlays=overlays,
+                beeps=beeps,
+                complex_body=complex_body,
+                video_label=label,
+            )
 
         # --- Construcción del comando ---
         # Nota: `-t` se coloca DESPUÉS de todos los inputs para que se aplique
@@ -502,6 +523,157 @@ class FFmpegTool:
             return "(W-w)/2", "(H-h)/2"
         raise ValueError(f"Unsupported watermark position: {position}")
 
+    def _render_with_extras(
+        self,
+        *,
+        input_path: str | Path,
+        output: Path,
+        start: float,
+        duration: float,
+        vf_parts: list[str],
+        vfilter_cwd: str | None,
+        watermark: dict[str, Any] | None,
+        output_fps: float,
+        audio_filter: str | None,
+        overlays: list[dict[str, Any]],
+        beeps: list[dict[str, Any]],
+        complex_body: str | None = None,
+        video_label: str = "[vmain]",
+    ) -> Path:
+        """Watermark and/or emoji PNG stickers and/or censor beeps.
+
+        The plain `render_clip` path stays untouched when none of these are set.
+        ``complex_body`` is a reframe graph that already ends at ``video_label``.
+        """
+        command = [
+            self._binary,
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-i",
+            str(input_path),
+        ]
+        has_watermark = bool(watermark and watermark.get("enabled"))
+        wm_index: int | None = None
+        next_index = 1
+        if has_watermark:
+            wm_file = watermark.get("file")
+            if not wm_file:
+                raise ValueError("watermark.file is required when watermark.enabled=true")
+            command += ["-i", str(wm_file)]
+            wm_index = next_index
+            next_index += 1
+        emoji_indexes: list[int] = []
+        for ov in overlays:
+            command += ["-i", str(ov["file"])]
+            emoji_indexes.append(next_index)
+            next_index += 1
+        command += ["-t", f"{duration:.3f}"]
+
+        if complex_body:
+            chains = [complex_body]
+            label = video_label.strip("[]") or "vmain"
+        else:
+            chains = [f"[0:v]{','.join(vf_parts)}[v0]"]
+            label = "v0"
+        if wm_index is not None:
+            width = int(watermark.get("width", 180))
+            x, y = self._position_xy(
+                watermark.get("position", "top_right"),
+                int(watermark.get("margin_x", 40)),
+                int(watermark.get("margin_y", 40)),
+            )
+            enable = ""
+            wm_start, wm_end = watermark.get("start"), watermark.get("end")
+            if wm_start is not None or wm_end is not None:
+                a = float(wm_start or 0.0)
+                b = float(wm_end) if wm_end is not None else duration
+                enable = f":enable='between(t,{a:.3f},{b:.3f})'"
+            chains.append(f"[{wm_index}:v]scale={width}:-1[wm]")
+            chains.append(f"[{label}][wm]overlay={x}:{y}{enable}[vwm]")
+            label = "vwm"
+        for i, ov in enumerate(overlays):
+            width = int(ov.get("width") or 150)
+            slot = int(ov.get("slot", i))
+            count = max(1, int(ov.get("count") or len(overlays)))
+            gap = 16
+            span = count * width + max(0, count - 1) * gap
+            x_expr = f"(W-{span})/2+{slot * (width + gap)}"
+            y_expr = str(ov.get("y") or "H*58/100")
+            a = float(ov.get("start") or 0.0)
+            b = float(ov.get("end") if ov.get("end") is not None else duration)
+            enable = f":enable='between(t,{a:.3f},{b:.3f})'"
+            nxt = "vout" if i == len(overlays) - 1 else f"ve{i}"
+            chains.append(f"[{emoji_indexes[i]}:v]scale={width}:-1,format=rgba[em{i}]")
+            chains.append(f"[{label}][em{i}]overlay={x_expr}:{y_expr}{enable}[{nxt}]")
+            label = nxt
+        if label != "vout":
+            chains.append(f"[{label}]null[vout]")
+
+        if beeps:
+            chains.append(self._censor_beep_graph(beeps, duration, audio_filter))
+            audio_map = ["-map", "[aout]"]
+        elif audio_filter:
+            chains.append(f"[0:a]{audio_filter}[aout]")
+            audio_map = ["-map", "[aout]"]
+        else:
+            audio_map = ["-map", "0:a?"]
+
+        command += ["-filter_complex", ";".join(chains), "-map", "[vout]", *audio_map]
+        if output_fps and output_fps > 0:
+            command += ["-r", f"{output_fps:.3f}"]
+        command += [
+            "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output),
+        ]
+        logger.info(
+            "rendering clip with overlays",
+            output=str(output),
+            emojis=len(overlays),
+            beeps=len(beeps),
+            watermark=has_watermark,
+        )
+        run_command(command, timeout=3600, cwd=vfilter_cwd)
+        return output
+
+    @staticmethod
+    def _censor_beep_graph(spans: list[dict[str, Any]], duration: float, tail: str | None) -> str:
+        """Duck the censored words and mix a short tone. Ends at `[aout]`."""
+        clean: list[tuple[float, float]] = []
+        for span in spans:
+            try:
+                a = max(0.0, float(span.get("start", 0.0)))
+                b = float(span.get("end", a))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            b = min(duration, max(b, a + 0.08))
+            if a >= duration:
+                continue
+            clean.append((a, b))
+        if not clean:
+            head = f"[0:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS"
+            return f"{head},{tail}[aout]" if tail else f"{head}[aout]"
+        expr = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in clean)
+        parts = [
+            f"[0:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,volume=0:enable='{expr}'[ducked]"
+        ]
+        labels = ["[ducked]"]
+        for i, (a, b) in enumerate(clean):
+            delay = max(0, int(round(a * 1000)))
+            parts.append(
+                f"sine=frequency=880:duration={b - a:.3f}:sample_rate=48000,"
+                f"adelay={delay}|{delay},apad=whole_dur={duration:.3f},volume=0.7[beep{i}]"
+            )
+            labels.append(f"[beep{i}]")
+        parts.append(
+            f"{''.join(labels)}amix=inputs={len(labels)}:duration=first:dropout_transition=0:normalize=0[mixed]"
+        )
+        if tail:
+            parts.append(f"[mixed]{tail}[aout]")
+        else:
+            parts.append("[mixed]anull[aout]")
+        return ";".join(parts)
+
     @staticmethod
     def _subtitle_filter(path: str | Path, fontsdir: str | Path | None = None) -> str:
         """Elige el filtro de FFmpeg correcto según la extensión del archivo.
@@ -509,9 +681,8 @@ class FFmpegTool:
         - `.srt`  → filtro `subtitles` (libass lo convierte).
         - `.ass`/`.ssa` → filtro `ass` (formatos estilizados avanzados).
 
-        `fontsdir` (MOLI-54): carpeta local del job con la fuente de marca
-        para libass (`fontsdir=...`). Es necesario porque el filtro no acepta
-        el `fontsdir` por command-line común.
+        `fontsdir` (MOLI-54 / MOLI-49): carpeta con la fuente de marca o el
+        preset (Anton/Montserrat) para libass (`fontsdir=...`).
         """
         ext = Path(path).suffix.lower()
         if ext in (".ass", ".ssa"):

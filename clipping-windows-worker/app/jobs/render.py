@@ -290,6 +290,15 @@ class RenderJob(BaseJob):
             decider=decider_options(payload),
         )
         t_render = time.perf_counter()
+        preset_fonts = self._stage_caption_font((applied.get("captions") or {}).get("font_file"))
+        emoji_overlays = self._emoji_overlays(applied, duration)
+        if isinstance(applied.get("captions"), dict):
+            applied["captions"]["emoji_applied"] = len(emoji_overlays)
+        censor_beeps = None
+        cap_applied = applied.get("captions") or {}
+        if cap_applied.get("censor_beep") and has_audio and not original_only:
+            censor_beeps = list(cap_applied.get("censor_spans") or [])
+        libass_fonts = self._combine_fonts(fontsdir, preset_fonts)
         ffmpeg.render_clip(
             input_path=source,
             output_path=output_path,
@@ -300,10 +309,12 @@ class RenderJob(BaseJob):
             watermark=watermark,
             output_fps=output_fps,
             audio_filter=audio_filter,
+            fontsdir=libass_fonts,
             video_filters=plan.vf,
             video_complex=plan.complex_graph,
             filter_cwd=str(work_dir) if plan.command_files else None,
-            fontsdir=fontsdir,
+            image_overlays=emoji_overlays or None,
+            censor_beeps=censor_beeps,
         )
         plan.metadata["timings"]["render_s"] = round(time.perf_counter() - t_render, 3)
 
@@ -419,6 +430,68 @@ class RenderJob(BaseJob):
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
         return dest
+
+    def _stage_caption_font(self, filename: str | None) -> str | None:
+        """Copy a shipped OFL font next to the ASS file. Returns the relative fontsdir."""
+        if not filename:
+            return None
+        src = Path(__file__).resolve().parent.parent / "assets" / "fonts" / filename
+        if not src.is_file():
+            self.logger.warning("caption font missing", font=filename)
+            return None
+        dest_dir = self.directory.output / "fonts"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src.name
+        if not dest.is_file() or dest.stat().st_size != src.stat().st_size:
+            dest.write_bytes(src.read_bytes())
+        return "fonts"
+
+    def _combine_fonts(self, brand_dir: Path | None, preset_rel: str | None) -> str | None:
+        """One libass fontsdir for the brand download and/or the preset file."""
+        staged = self.directory.output / "fonts"
+        has_preset = bool(preset_rel) and staged.is_dir() and any(staged.iterdir())
+        copied = False
+        if brand_dir is not None and Path(brand_dir).is_dir():
+            for font in Path(brand_dir).iterdir():
+                if font.suffix.lower() not in {".ttf", ".otf", ".ttc"}:
+                    continue
+                staged.mkdir(parents=True, exist_ok=True)
+                dest = staged / font.name
+                if not dest.is_file() or dest.stat().st_size != font.stat().st_size:
+                    dest.write_bytes(font.read_bytes())
+                copied = True
+        if has_preset or copied:
+            return str(staged.resolve())
+        if brand_dir is not None:
+            return str(brand_dir)
+        return None
+
+    def _emoji_overlays(self, applied: dict, duration: float) -> list[dict[str, Any]]:
+        cues = list((applied.get("captions") or {}).get("emoji_cues") or [])
+        if not cues:
+            return []
+        from app.tools.emoji_png import resolve_emoji_png
+
+        cache = self.directory.output / "emoji"
+        ready: list[tuple[dict[str, Any], Path]] = []
+        for cue in cues:
+            png = resolve_emoji_png(str(cue.get("emoji") or ""), cache)
+            if png is None:
+                self.logger.warning("emoji png missing", emoji=cue.get("emoji"))
+                continue
+            ready.append((cue, png))
+        count = len(ready)
+        return [
+            {
+                "file": str(png),
+                "start": cue.get("start") or 0.0,
+                "end": cue.get("end") if cue.get("end") is not None else duration,
+                "width": 150,
+                "slot": slot,
+                "count": count,
+            }
+            for slot, (cue, png) in enumerate(ready)
+        ]
 
     def _frame_checks(self, video: Path, applied: dict, payload: dict, probe: dict, watermark: dict) -> dict[str, Any]:
         """Sample the rendered clip. Missing samples omit the bool so the VPS keeps metadata-only."""
