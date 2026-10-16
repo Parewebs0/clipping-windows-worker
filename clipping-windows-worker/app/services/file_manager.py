@@ -8,6 +8,11 @@ from pathlib import Path
 import httpx
 
 from app.config import Settings
+from app.services.download_errors import (
+    PermanentDownloadError,
+    permanent_download_kind,
+    strip_ansi,
+)
 from app.services.drive_resolver import (
     DriveAssetNotFound,
     DriveAuthRequired,
@@ -194,7 +199,14 @@ class FileManager:
         logger.info("downloading file (yt-dlp)", url=url, template=out_template)
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            try:
+                info = ydl.extract_info(url, download=True)
+            except yt_dlp.utils.DownloadError as exc:
+                text = strip_ansi(str(exc)).strip() or "yt-dlp download failed"
+                kind = permanent_download_kind(text)
+                if kind:
+                    raise PermanentDownloadError(kind, text[:500]) from exc
+                raise
             if isinstance(info, dict) and "entries" in info and info["entries"]:
                 info = info["entries"][0]
 
