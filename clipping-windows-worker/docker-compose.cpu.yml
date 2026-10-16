@@ -1,0 +1,35 @@
+# CPU fallback worker. Runs next to the API on the mini PC:
+#   docker compose -f docker-compose.cpu.yml --env-file .env.cpu up -d --build
+# Claims work only while the GPU worker is silent (server FALLBACK_WORKER_IDS).
+services:
+  worker-cpu:
+    build: .
+    image: clipping-worker-cpu
+    restart: unless-stopped
+    cpus: 4
+    mem_limit: 4g
+    memswap_limit: 4g
+    env_file: .env.cpu
+    environment:
+      WORKER_ID: ${WORKER_ID:-minipc-cpu-worker-01}
+      DEVICE: cpu
+      COMPUTE_TYPE: int8
+      WHISPER_MODEL: small
+      DIARIZATION_ENABLED: "false"
+      MAX_CONCURRENT_JOBS: "1"
+      NICE_LEVEL: "10"
+      MEDIA_RETENTION_ENABLED: "true"
+      MEDIA_RETENTION_HOURS: "24"
+      WORKING_DIRECTORY: /data/work
+      CLIP_STORAGE_ROOT: /data/clips
+      GOG_PATH: /usr/local/bin/gog
+      # Publishing stays off: no platform tokens are passed in.
+      YOUTUBE_REFRESH_TOKEN: ""
+      INSTAGRAM_ACCESS_TOKEN: ""
+      TIKTOK_ACCESS_TOKEN: ""
+      OMP_NUM_THREADS: "4"
+    volumes:
+      - ${WORKER_DATA_DIR:-./data-cpu}:/data
+      - ${WORKER_MODELS_DIR:-./models-cpu}:/models
+      - ${GOG_CONFIG_DIR:-./gog/config}:/root/.config/gogcli
+      - ${GOG_SHARE_DIR:-./gog/share}:/root/.local/share/gogcli

@@ -19,3 +19,6 @@ htmlcov/
 # IDE
 .idea/
 .vscode/
+.env.cpu
+data-cpu/
+models-cpu/
