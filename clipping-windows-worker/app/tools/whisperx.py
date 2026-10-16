@@ -98,15 +98,16 @@ class WhisperXTool:
         if device == "cpu":
             compute_type = "int8"
 
+        model_name = self.settings.whisper_model or _MODEL_NAME
         logger.info(
             "loading whisperx model",
-            model=_MODEL_NAME,
+            model=model_name,
             device=device,
             compute_type=compute_type,
             language=language,
         )
         self._model = whisperx.load_model(
-            _MODEL_NAME,
+            model_name,
             device=device,
             compute_type=compute_type,
             language=language,

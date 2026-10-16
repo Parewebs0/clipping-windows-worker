@@ -34,6 +34,19 @@ class Settings(BaseSettings):
     # and the transcript keeps going without speaker labels.
     hf_token: str | None = None
     allow_cpu_fallback: bool = False
+    # CPU fallback worker (docker/cpu). Defaults keep the Windows GPU worker as-is.
+    whisper_model: str = "large-v3"
+    # Payload `diarization` is honoured only when this is on (pyannote on CPU
+    # is too slow/heavy for the mini PC).
+    diarization_enabled: bool = True
+    # Process niceness added at startup (0 = unchanged). Inherited by ffmpeg.
+    nice_level: int = Field(default=0, ge=0, le=19)
+    # Delete media older than media_retention_hours under the working
+    # directory (downloads/jobs/outputs/temp) and clip_storage_root.
+    # Off by default so the Windows worker keeps its files.
+    media_retention_enabled: bool = False
+    media_retention_hours: float = Field(default=24.0, gt=0.0)
+    retention_sweep_interval: float = Field(default=900.0, ge=30.0)
     auto_cleanup: bool = True
     job_retention_hours: float = Field(default=24.0, ge=0.0)
     log_level: str = "INFO"

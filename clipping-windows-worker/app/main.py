@@ -14,6 +14,7 @@ Lifecycle:
 
 from __future__ import annotations
 
+import os
 import time
 
 from app.config import Settings, get_settings
@@ -25,6 +26,7 @@ from app.services.api_client import (
 )
 from app.services.job_manager import JobManager
 from app.services.job_runner import JobRunner
+from app.services.retention import sweep_media
 from app.services.system_info import SystemInfoService
 from app.utils.logging import (
     configure_logging,
@@ -69,6 +71,8 @@ class Worker:
         logger.info(
             "Worker starting"
         )
+
+        apply_nice(self.settings.nice_level)
 
         logger.info(
             "Worker ID",
@@ -146,9 +150,17 @@ class Worker:
         logger.info(
             "Waiting for jobs..."
         )
+        last_sweep = 0.0
 
         while True:
             try:
+                if (
+                    self.settings.media_retention_enabled
+                    and time.monotonic() - last_sweep >= self.settings.retention_sweep_interval
+                ):
+                    last_sweep = time.monotonic()
+                    sweep_media(self.settings)
+
                 job = self.api.get_next_job()
 
                 if job is not None:
@@ -219,6 +231,17 @@ class Worker:
             logger.info(
                 "Worker stopped"
             )
+
+
+def apply_nice(level: int) -> int:
+    """Lower our CPU priority (children such as ffmpeg inherit it)."""
+    if level <= 0 or not hasattr(os, "nice"):
+        return 0
+    try:
+        return os.nice(level)
+    except OSError as exc:
+        logger.warning("nice failed", error=str(exc))
+        return 0
 
 
 def _build_api_client(
