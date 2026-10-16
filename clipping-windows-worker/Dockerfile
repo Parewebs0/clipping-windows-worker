@@ -6,10 +6,12 @@ WORKDIR /app
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-# CPU-only torch first so whisperx does not pull the CUDA wheels.
-RUN pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+# CPU-only torch: the cpu index wins (x.y.z+cpu sorts above x.y.z), so
+# whisperx does not pull the CUDA wheels.
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --index-url https://download.pytorch.org/whl/cpu \
+      --extra-index-url https://pypi.org/simple -r requirements.txt \
+ && python -c "import torch; assert '+cpu' in torch.__version__, torch.__version__"
 
 # gog CLI for Drive downloads; config/keyring are bind-mounted (see compose).
 ARG GOG_VERSION=0.40.0

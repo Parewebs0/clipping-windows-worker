@@ -98,7 +98,7 @@ class WhisperXTool:
         if device == "cpu":
             compute_type = "int8"
 
-        model_name = self.settings.whisper_model or _MODEL_NAME
+        model_name = getattr(self.settings, "whisper_model", None) or _MODEL_NAME
         logger.info(
             "loading whisperx model",
             model=model_name,

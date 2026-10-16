@@ -23,7 +23,7 @@ class TranscribeJob(BaseJob):
         # (contrato del VPS / OpenClaw). Priorizar `video_path` si llega.
         video_path = payload.get("video_path") or payload.get("video")
         language = payload.get("language", "auto")
-        diarization = bool(payload.get("diarization", False)) and self.settings.diarization_enabled
+        diarization = bool(payload.get("diarization", False)) and getattr(self.settings, "diarization_enabled", True)
         # MOLI-54: vocabulario de marca como initial_prompt (ortografía exacta:
         # "boxabl" → "BOXABL") sin condicionar las palabras.
         initial_prompt = payload.get("initial_prompt") or None
