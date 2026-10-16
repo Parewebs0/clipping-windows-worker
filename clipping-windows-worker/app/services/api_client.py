@@ -10,6 +10,7 @@ import structlog
 from app.config import Settings
 from app.models.job import Job
 from app.models.worker import Heartbeat, WorkerRegistration
+from app.services.download_errors import worker_fail_body
 
 logger = structlog.get_logger()
 
@@ -43,6 +44,8 @@ class BaseAPIClient:
         self,
         job_id: str,
         error: str,
+        *,
+        permanent: bool = False,
     ) -> bool:
         raise NotImplementedError
 
@@ -189,15 +192,15 @@ class APIClient(BaseAPIClient):
         self,
         job_id: str,
         error: str,
+        *,
+        permanent: bool = False,
     ) -> bool:
         response = self.client.post(
             f"/worker/jobs/{job_id}/fail",
             params={
                 "worker_id": self.settings.worker_id,
             },
-            json={
-                "error_message": error,
-            },
+            json=worker_fail_body(error, permanent=permanent),
         )
         response.raise_for_status()
 
@@ -226,6 +229,7 @@ class MockAPIClient(BaseAPIClient):
 
         self.results: dict[str, dict[str, Any]] = {}
         self.errors: dict[str, str] = {}
+        self.permanent_failures: set[str] = set()
 
     def register_worker(
         self,
@@ -292,9 +296,13 @@ class MockAPIClient(BaseAPIClient):
         self,
         job_id: str,
         error: str,
+        *,
+        permanent: bool = False,
     ) -> bool:
         self.errors[job_id] = error
         self.failed_jobs.add(job_id)
+        if permanent:
+            self.permanent_failures.add(job_id)
 
         logger.info(
             "mock: job failed",

@@ -19,6 +19,7 @@ from typing import Any
 from app.config import Settings
 from app.models.job import Job
 from app.services.api_client import BaseAPIClient
+from app.services.download_errors import PermanentDownloadError, permanent_download_kind
 from app.services.job_manager import JobManager
 from app.utils.logging import get_logger
 
@@ -238,9 +239,20 @@ class JobRunner:
         )
 
         try:
+            # The traceback stays in the debug log. The API stores
+            # error_message and used to 422 when this was the full stack
+            # (often with ANSI color from yt-dlp).
+            message = str(exc)
+            kind = permanent_download_kind(message)
+            permanent = isinstance(exc, PermanentDownloadError) or (
+                job.type == "download" and kind is not None
+            )
+            if permanent and kind and not message.startswith(f"{kind}:"):
+                message = f"{kind}: {message}"
             self.api.fail_job(
                 job.id,
-                error_trace,
+                message,
+                permanent=permanent,
             )
 
         except Exception as report_exc:  # noqa: BLE001
