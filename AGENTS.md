@@ -394,7 +394,7 @@ destination = self.directory.input / filename
 3. **`ffprobe` y WhisperX no miran la extensión** — abren por magic bytes. Probado: el job `a766f7bc` consumió `c9836360-…bin` con magic `ftyp isom` y produjo `audio.wav` válido de 30.53 s sin tocar la extensión.
 4. **Es retro-compatible y testeable** — `test_download_http_e2e.py` y `test_download_youtube_branch.py` asumen `<job_id>.bin` para HTTP.
 
-**Cuándo NO es `.bin`:** solo YouTube (`_needs_ytdlp(url)`) → yt-dlp produce `<video_id>.mp4` real tras el merge `webm → mp4`.
+**Cuándo NO es `.bin`:** hosts de yt-dlp (`_needs_ytdlp(url)`: YouTube, Twitch, Kick, TikTok, Vimeo) → yt-dlp produce `<video_id>.mp4` real tras el merge `webm → mp4`.
 
 **Si en el futuro se quiere `.mp4` en disco:** hay que añadir post-sniffing con `ffprobe` + rename. Hoy no es prioritario porque el pipeline funciona.
 
