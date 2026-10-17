@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 from app.jobs.base import BaseJob
 from app.services.file_manager import FileManager, _needs_ytdlp
+from app.utils.storage_layout import StorageLayout, StoragePathError
 from app.tools.ffprobe import FFprobeTool
 
 _KIND_TO_EXT = {
@@ -107,6 +108,13 @@ class DownloadJob(BaseJob):
     def _persist(self, src: Path, payload: dict[str, Any]) -> Path:
         asset_id = str(payload.get("asset_id") or self.job.id)
         dest_dir = self.settings.downloads_dir / asset_id
+        campaign_id = payload.get("campaign_id")
+        if getattr(self.settings, "storage_root", None) and campaign_id not in (None, ""):
+            # STORAGE_ROOT layout: <root>/<campaign_id>/sources/<asset_id>/
+            try:
+                dest_dir = StorageLayout(self.settings.storage_root).sources_dir(campaign_id, asset_id)
+            except StoragePathError:
+                pass  # odd ids: keep the legacy downloads/ path
         dest_dir.mkdir(parents=True, exist_ok=True)
         name = str(payload.get("filename") or "")
         ext = Path(name).suffix.lower() if name else ""

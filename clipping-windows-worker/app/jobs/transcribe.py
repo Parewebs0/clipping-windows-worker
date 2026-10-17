@@ -58,7 +58,8 @@ class TranscribeJob(BaseJob):
 
         self.logger.info("extracting audio", video=str(source))
         ffmpeg = FFmpegTool(self.settings)
-        audio_path = self.directory.temp / "audio.wav"
+        work = self._work_dir(payload)
+        audio_path = (work or self.directory.temp) / "audio.wav"
         ffmpeg.extract_audio(source, audio_path)
 
         self.logger.info("starting whisperx", language=language, diarization=diarization,
@@ -72,7 +73,7 @@ class TranscribeJob(BaseJob):
         )
 
         # Guardar transcript.json en el directorio de salida.
-        transcript_path = self.directory.output / "transcript.json"
+        transcript_path = (work or self.directory.output) / "transcript.json"
         transcript_path.write_text(
             json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -89,6 +90,21 @@ class TranscribeJob(BaseJob):
             "segments": result.get("segments", []),
             "words": result.get("words", []),
         }
+
+    def _work_dir(self, payload: dict) -> Path | None:
+        """<STORAGE_ROOT>/<campaign_id>/work/<asset_id>/ when configured, else None (job dir)."""
+        root = getattr(self.settings, "storage_root", None)
+        cid, aid = payload.get("campaign_id"), payload.get("asset_id")
+        if not root or cid in (None, "") or not aid:
+            return None
+        from app.utils.storage_layout import StorageLayout, StoragePathError
+
+        try:
+            work = StorageLayout(root).work_dir(cid, aid)
+        except StoragePathError:
+            return None  # odd ids: keep the job-dir behaviour
+        work.mkdir(parents=True, exist_ok=True)
+        return work
 
     def _resolve_input(self, video_path: str) -> Path:
         """Resuelve una ruta de entrada, absoluta o relativa al job."""

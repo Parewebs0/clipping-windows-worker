@@ -87,12 +87,39 @@ class ClipStorage:
         self,
         storage_root: Path | str,
         campaign_id: int | str,
+        *,
+        campaign_layout: bool = False,
     ) -> None:
         if campaign_id is None:
             raise ClipStorageError("campaign_id is required")
         self._root = Path(storage_root)
         self._campaign_id = str(campaign_id)
         self._campaign_dir = self._root / self._campaign_id
+        # STORAGE_ROOT layout: pending_upload -> clips/pending, uploaded and
+        # archived -> clips/done. Location names (API contract) do not change.
+        self._campaign_layout = campaign_layout
+        if campaign_layout:
+            from app.utils.storage_layout import campaign_key
+
+            try:
+                campaign_key(campaign_id)
+            except ValueError as exc:
+                raise ClipStorageError(str(exc)) from exc
+
+    @classmethod
+    def for_settings(cls, settings, campaign_id: int | str) -> "ClipStorage":
+        """STORAGE_ROOT layout when configured, legacy clip_storage_root otherwise."""
+        root = getattr(settings, "storage_root", None)
+        if root:
+            return cls(root, campaign_id, campaign_layout=True)
+        return cls(settings.clip_storage_root, campaign_id)
+
+    def _location_dir(self, location: str) -> Path:
+        if self._campaign_layout:
+            from app.utils.storage_layout import CLIP_DIRS
+
+            return self._campaign_dir.joinpath(*CLIP_DIRS[location])
+        return self._campaign_dir / location
 
     # ------------------------------------------------------------------
     # Paths
@@ -113,7 +140,7 @@ class ClipStorage:
                 f"location must be one of {_LOCATIONS}, got {location!r}"
             )
         safe = _safe_filename(clip_id)
-        return self._campaign_dir / location / f"{safe}.mp4"
+        return self._location_dir(location) / f"{safe}.mp4"
 
     def campaign_dir(self) -> Path:
         return self._campaign_dir
@@ -128,7 +155,7 @@ class ClipStorage:
     def ensure(self) -> dict[str, Path]:
         """Crea las tres subcarpetas si no existen y devuelve sus paths."""
         paths = {
-            location: self._campaign_dir / location for location in _LOCATIONS
+            location: self._location_dir(location) for location in _LOCATIONS
         }
         for p in paths.values():
             p.mkdir(parents=True, exist_ok=True)
