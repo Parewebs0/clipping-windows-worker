@@ -19,9 +19,18 @@ services:
       MAX_CONCURRENT_JOBS: "1"
       NICE_LEVEL: "10"
       MEDIA_RETENTION_ENABLED: "true"
+      # Legacy dirs (/data/work, /data/clips): jobs/temp 24 h, clips 7 days.
       MEDIA_RETENTION_HOURS: "24"
+      CLIP_RETENTION_DAYS: "7"
       WORKING_DIRECTORY: /data/work
       CLIP_STORAGE_ROOT: /data/clips
+      # Per-campaign storage, same path inside and outside the container so the
+      # paths stored in the DB (asset.local_path, clip file_path) stay valid.
+      STORAGE_ROOT: ${STORAGE_ROOT:-/srv/datos/clipping}
+      STORAGE_CLEANUP_ENABLED: ${STORAGE_CLEANUP_ENABLED:-true}
+      # Logs what would be deleted; set to "false" only after reviewing them.
+      STORAGE_CLEANUP_DRY_RUN: ${STORAGE_CLEANUP_DRY_RUN:-true}
+      DISK_HIGH_WATERMARK_PCT: "80"
       GOG_PATH: /usr/local/bin/gog
       # Publishing stays off: no platform tokens are passed in.
       YOUTUBE_REFRESH_TOKEN: ""
@@ -30,6 +39,7 @@ services:
       OMP_NUM_THREADS: "4"
     volumes:
       - ${WORKER_DATA_DIR:-./data-cpu}:/data
+      - ${STORAGE_ROOT:-/srv/datos/clipping}:${STORAGE_ROOT:-/srv/datos/clipping}
       - ${WORKER_MODELS_DIR:-./models-cpu}:/models
       - ${GOG_CONFIG_DIR:-./gog/config}:/root/.config/gogcli
       - ${GOG_SHARE_DIR:-./gog/share}:/root/.local/share/gogcli

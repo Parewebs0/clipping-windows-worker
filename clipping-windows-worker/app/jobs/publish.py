@@ -206,16 +206,18 @@ class PublishJob(BaseJob):
         campaign_id: int | str,
         file_path: str | None,
     ) -> Path:
-        storage = ClipStorage(
-            storage_root=self.settings.clip_storage_root,
-            campaign_id=campaign_id,
-        )
+        storage = ClipStorage.for_settings(self.settings, campaign_id)
         already = storage.path_for(clip_id, "uploaded")
         if already.exists():
             return already
         src: Path | None = Path(file_path) if file_path else None
         if src is None or not src.exists():
             src = storage.path_for(clip_id, "pending_upload")
+        if not src.exists() and getattr(self.settings, "storage_root", None):
+            # Clip written before STORAGE_ROOT was set: legacy pending_upload/.
+            legacy = ClipStorage(self.settings.clip_storage_root, campaign_id).path_for(clip_id, "pending_upload")
+            if legacy.exists():
+                src = legacy
         if not src.exists():
             raise FileNotFoundError(f"clip not in pending_upload or payload path: {src}")
         try:

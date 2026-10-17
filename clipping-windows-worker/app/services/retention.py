@@ -10,25 +10,43 @@ from app.utils.logging import get_logger
 logger = get_logger("retention")
 
 
-def _roots(settings: Settings) -> list[Path]:
-    roots = [settings.downloads_dir, settings.jobs_dir, settings.outputs_dir, settings.temp_dir]
+def _roots(settings: Settings) -> list[tuple[Path, float]]:
+    """(root, max_age_hours). Clips keep clip_retention_days, not 24 h."""
+    hours = settings.media_retention_hours
+    roots = [(settings.downloads_dir, hours), (settings.jobs_dir, hours),
+             (settings.outputs_dir, hours), (settings.temp_dir, hours)]
     if settings.clip_storage_root:
-        roots.append(Path(settings.clip_storage_root))
+        roots.append((Path(settings.clip_storage_root), settings.clip_retention_days * 24))
     return roots
 
 
-def sweep_media(settings: Settings, *, now: float | None = None) -> dict[str, int]:
-    """Delete files older than media_retention_hours, then empty dirs.
+def _inside(path: Path, other: Path | None) -> bool:
+    if other is None:
+        return False
+    try:
+        path.resolve().relative_to(Path(other).resolve())
+        return True
+    except (ValueError, OSError):
+        return False
 
-    Logs and publish_state are never touched.
+
+def sweep_media(settings: Settings, *, now: float | None = None) -> dict[str, int]:
+    """Delete files older than their root's max age, then empty dirs.
+
+    Legacy roots only: STORAGE_ROOT is handled by storage_cleanup (it must ask
+    the server first). Logs and publish_state are never touched.
     """
     now = time.time() if now is None else now
-    cutoff = now - settings.media_retention_hours * 3600
+    storage_root = getattr(settings, "storage_root", None)
     removed = freed = 0
-    for root in _roots(settings):
-        if not root.is_dir():
+    for root, max_age_h in _roots(settings):
+        if not root.is_dir() or _inside(root, storage_root):
             continue
+        cutoff = now - max_age_h * 3600
+        nested = storage_root is not None and _inside(Path(storage_root), root)
         for path in sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            if nested and _inside(path, storage_root):
+                continue
             try:
                 if path.is_file() or path.is_symlink():
                     st = path.lstat()

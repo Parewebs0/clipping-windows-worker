@@ -27,6 +27,7 @@ from app.services.api_client import (
 from app.services.job_manager import JobManager
 from app.services.job_runner import JobRunner
 from app.services.retention import sweep_media
+from app.services.storage_cleanup import run_cleanup
 from app.services.system_info import SystemInfoService
 from app.utils.logging import (
     configure_logging,
@@ -151,6 +152,7 @@ class Worker:
             "Waiting for jobs..."
         )
         last_sweep = 0.0
+        last_storage_cleanup = 0.0
 
         while True:
             try:
@@ -160,6 +162,14 @@ class Worker:
                 ):
                     last_sweep = time.monotonic()
                     sweep_media(self.settings)
+
+                if (
+                    self.settings.storage_cleanup_enabled
+                    and self.settings.storage_root
+                    and time.monotonic() - last_storage_cleanup >= self.settings.storage_cleanup_interval
+                ):
+                    last_storage_cleanup = time.monotonic()
+                    run_cleanup(self.settings, self.api)
 
                 job = self.api.get_next_job()
 

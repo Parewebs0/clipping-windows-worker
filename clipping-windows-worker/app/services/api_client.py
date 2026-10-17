@@ -49,6 +49,10 @@ class BaseAPIClient:
     ) -> bool:
         raise NotImplementedError
 
+    def storage_check(self, body: dict[str, Any]) -> dict[str, Any]:
+        """POST /worker/storage/check (read-only on the server)."""
+        raise NotImplementedError
+
     def close(self) -> None:
         pass
 
@@ -212,12 +216,22 @@ class APIClient(BaseAPIClient):
 
         return True
 
+    def storage_check(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = self.client.post("/worker/storage/check", json=body)
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else {}
+
     def close(self) -> None:
         self.client.close()
 
 
 class MockAPIClient(BaseAPIClient):
     """Cliente mock utilizado para tests locales."""
+
+    def storage_check(self, body: dict[str, Any]) -> dict[str, Any]:
+        # Nothing is deletable in mock mode.
+        return {"assets": {}, "campaigns": {}, "clips": {}}
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings

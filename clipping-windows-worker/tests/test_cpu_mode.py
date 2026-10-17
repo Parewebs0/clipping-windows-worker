@@ -104,11 +104,16 @@ def test_retention_deletes_only_old_media(tmp_path):
     for p in (old, clip, log):
         os.utime(p, (past, past))
     out = sweep_media(s)
-    assert out["removed"] == 2
-    assert not old.exists() and not clip.exists()
+    assert out["removed"] == 1
+    assert not old.exists()
+    assert clip.exists()  # clips keep CLIP_RETENTION_DAYS (7), not 24 h
     assert not old.parent.exists()
     assert new.exists()
     assert log.exists()  # logs are never swept
+    week = time.time() - 8 * 86400
+    os.utime(clip, (week, week))
+    assert sweep_media(s)["removed"] == 1
+    assert not clip.exists()
 
 
 def test_apply_nice(monkeypatch):

@@ -200,10 +200,7 @@ class QAJob(BaseJob):
           - Idempotente: si el destino ya existe, se sobreescribe.
         """
         try:
-            storage = ClipStorage(
-                storage_root=self.settings.clip_storage_root,
-                campaign_id=campaign_id,
-            )
+            storage = ClipStorage.for_settings(self.settings, campaign_id)
             destination = storage.copy_to_pending_upload(
                 src=source,
                 clip_id=clip_id,

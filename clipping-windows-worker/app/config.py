@@ -47,6 +47,22 @@ class Settings(BaseSettings):
     media_retention_enabled: bool = False
     media_retention_hours: float = Field(default=24.0, gt=0.0)
     retention_sweep_interval: float = Field(default=900.0, ge=30.0)
+    # Per-campaign storage (STORAGE_ROOT). Unset = legacy layout (Windows):
+    # downloads under working_directory, clips under clip_storage_root.
+    # Set (mini PC: /srv/datos/clipping) = <root>/<campaign_id>/{sources,work,
+    # clips/pending,clips/done}. Old paths in queued jobs keep working because
+    # jobs read the absolute path they are given.
+    storage_root: Path | None = None
+    # Cleanup of storage_root driven by POST /worker/storage/check (server says
+    # what is decided / archived / idle). Off by default; dry-run by default.
+    storage_cleanup_enabled: bool = False
+    storage_cleanup_dry_run: bool = True
+    storage_cleanup_interval: float = Field(default=1800.0, ge=60.0)
+    # Clips nobody picked up (pending/done) are deleted after this many days.
+    clip_retention_days: float = Field(default=7.0, gt=0.0)
+    # Above this disk usage (percent of the storage_root filesystem) the oldest
+    # processed sources go first.
+    disk_high_watermark_pct: float = Field(default=80.0, gt=0.0, le=100.0)
     auto_cleanup: bool = True
     job_retention_hours: float = Field(default=24.0, ge=0.0)
     log_level: str = "INFO"
@@ -116,6 +132,13 @@ class Settings(BaseSettings):
         # PUBLISH_STATE_DIR= (empty) must mean "default", not Path(".").
         if isinstance(value, str) and not value.strip():
             return None
+        return value
+
+    @field_validator("storage_root", mode="before")
+    @classmethod
+    def _empty_storage_root_is_none(cls, value: object) -> object:
+        if isinstance(value, str):
+            return Path(value).expanduser() if value.strip() else None
         return value
 
     @field_validator("working_directory", mode="before")
