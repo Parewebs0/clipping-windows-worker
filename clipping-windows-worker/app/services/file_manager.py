@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -32,19 +33,29 @@ _CHUNK_SIZE = 1024 * 1024
 
 # Hosts que requieren un extractor específico (yt-dlp).
 # YouTube no expone el MP4 vía GET directo: responde con la watch page HTML.
+# Lo mismo pasa con los VODs de Twitch/Kick (HLS) y las páginas de TikTok/Vimeo.
+# Se compara con el hostname (exacto o subdominio: www., m., player., ...),
+# no como subcadena, para que p.ej. "sidekick.com" no cuente como kick.com.
 _YT_DLP_HOSTS: tuple[str, ...] = (
     "youtube.com",
     "youtu.be",
     "www.youtube.com",
     "m.youtube.com",
     "music.youtube.com",
+    "twitch.tv",
+    "kick.com",
+    "tiktok.com",
+    "vimeo.com",
 )
 
 
 def _needs_ytdlp(url: str) -> bool:
     """True si la URL apunta a un host que necesita yt-dlp."""
-    lowered = url.lower()
-    return any(host in lowered for host in _YT_DLP_HOSTS)
+    try:
+        host = (urlparse((url or "").strip()).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == h or host.endswith("." + h) for h in _YT_DLP_HOSTS)
 
 
 class FileManager:
@@ -63,7 +74,7 @@ class FileManager:
         """Descarga un archivo y devuelve la ruta local.
 
         Enruta automáticamente:
-        - YouTube /youtu.be → ``yt_dlp.YoutubeDL`` (descarga el MP4/WebM real).
+        - YouTube, Twitch, Kick, TikTok, Vimeo → ``yt_dlp.YoutubeDL`` (descarga el vídeo real).
         - Google Drive / Google Docs → ``drive_resolver`` reescribe la URL
           (view→uc, listado de carpetas, scraping de Docs) y aplica cookies
           de sesión si están configuradas.
