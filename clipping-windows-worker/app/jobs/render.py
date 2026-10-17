@@ -750,7 +750,8 @@ class RenderJob(BaseJob):
         segment was sampled. Contrast in the style's real window does not
         depend on how light the plate is. No usable sample leaves the key
         unset (the VPS then falls back to metadata) instead of defaulting
-        to false.
+        to false. A control band full of strokes (detail, overlay, source
+        text) is not a usable negative either: the key stays unset.
         """
         vw, vh = probe_size
         style = ((payload.get("captions") or {}).get("style") or {})
@@ -792,8 +793,17 @@ class RenderJob(BaseJob):
             samples.append(sample)
         if not scores:
             return
+        # A saturated control band (detail, overlay, source text, stream chat)
+        # cannot prove the captions are absent. Saying false there blocks a
+        # clip that did burn them. If every sample is in that state, omit the
+        # key so the VPS falls back to metadata.
+        decidable = [
+            (cap, ctrl) for cap, ctrl in scores if not _caption_sample_undecidable(cap, ctrl)
+        ]
+        if not decidable:
+            return
         out["captions_visible"] = any(
-            _caption_contrast_visible(cap, ctrl) for cap, ctrl in scores
+            _caption_contrast_visible(cap, ctrl) for cap, ctrl in decidable
         )
 
     def _logo_crop(self, *, video_w: int, video_h: int, logo: Path, watermark: dict) -> str | None:
@@ -924,6 +934,19 @@ _CAPTION_SCORE_MARGIN = 0.05
 def _caption_contrast_visible(score: float, control: float) -> bool:
     """True when the caption window is a stroke and busier than the control band."""
     return score >= _CAPTION_SCORE_MIN and score >= control + _CAPTION_SCORE_MARGIN
+
+
+# Control at or above this is too busy to trust a negative: the same stroke
+# metric lights up on source text, chat overlays, and fine detail.
+_CAPTION_CONTROL_SATURATED = 0.3
+_CAPTION_BOTH_SATURATED = 0.9
+
+
+def _caption_sample_undecidable(score: float, control: float) -> bool:
+    """True when this sample must not vote `captions_visible` false."""
+    if control >= _CAPTION_CONTROL_SATURATED:
+        return True
+    return score > _CAPTION_BOTH_SATURATED and control > _CAPTION_BOTH_SATURATED
 
 
 def _control_band_y(height: int, caption_y: int, region_h: int) -> int | None:

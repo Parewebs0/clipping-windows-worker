@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.config import Settings
-from app.jobs.render import RenderJob, caption_sample_times
+from app.jobs.render import RenderJob, _control_band_y, caption_sample_times
 from app.models.job import Job
 from app.tools.captions import caption_search_window, write_ass
 
@@ -156,6 +156,74 @@ def test_no_burned_captions_is_false(tmp_path):
         None, duration=duration,
     )
     assert _visible(tmp_path, video, captions, duration=duration)["captions_visible"] is False
+
+
+def _controls(checks: dict) -> list[float]:
+    return [
+        float(row["control"])
+        for row in checks["samples"]
+        if row.get("what") == "captions" and "control" in row
+    ]
+
+
+def test_noise_with_captions_does_not_block(tmp_path):
+    """Fine detail saturates the control band. That must not become false."""
+    duration = 1.2
+    captions = _captions("bottom")
+    # 8px checkerboard: every stroke window in the control band scores high.
+    lavfi = (
+        f"color=c=black:size={W}x{H}:rate=15:duration={duration},"
+        "format=gray,geq=lum='if(mod(floor(X/8)+floor(Y/8),2),16,235)'"
+    )
+    video = _burn(tmp_path, lavfi, captions, duration=duration)
+    checks = _visible(tmp_path, video, captions, duration=duration)
+    assert checks.get("captions_visible") is not False
+    assert _controls(checks) and min(_controls(checks)) >= 0.3
+    assert "captions_visible" not in checks
+
+
+def test_source_text_in_control_band_does_not_block(tmp_path):
+    """Chat or a title already in the picture must not fail the caption check."""
+    duration = 1.2
+    captions = _captions("bottom")
+    window = caption_search_window(W, H, captions["style"])
+    control_y = _control_band_y(H, int(window["y"]), int(window["h"]))
+    assert control_y is not None
+    src = tmp_path / "src.mp4"
+    font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    # Outlined lines fill the control band. No ':' in the strings: ffmpeg
+    # splits a filtergraph on that character even inside text='...'.
+    band_h = int(window["h"])
+    draws = []
+    step = 40
+    for i, line in enumerate(("LIVE CHAT", "viewer lets go", "BOXABL now", "clip this")):
+        y = int(control_y) + 4 + i * step
+        if y + 36 > int(control_y) + band_h:
+            break
+        draws.append(
+            "drawtext=fontfile=" + font
+            + f":text='{line}':x=24:y={y}:fontsize=36:fontcolor=white:borderw=4:bordercolor=black"
+        )
+    assert draws
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i",
+         f"color=c=0xF2F2F2:size={W}x{H}:rate=15:duration={duration}",
+         "-vf", ",".join(draws), "-pix_fmt", "yuv420p", "-an", str(src)],
+        check=True, capture_output=True,
+    )
+    ass = tmp_path / "overlay.ass"
+    write_ass(ass, width=W, height=H, captions=captions, on_screen_text={}, duration=duration)
+    out = tmp_path / "burned.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src.name, "-vf", f"ass={ass.name}",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an", out.name],
+        check=True, capture_output=True, cwd=tmp_path,
+    )
+    checks = _visible(tmp_path, out, captions, duration=duration)
+    controls = _controls(checks)
+    assert checks.get("captions_visible") is not False
+    assert controls and min(controls) >= 0.3, controls
+    assert "captions_visible" not in checks
 
 
 def test_busy_frame_without_captions_is_false(tmp_path):
