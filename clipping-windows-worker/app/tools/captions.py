@@ -201,6 +201,56 @@ def resolve_caption_style(style: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+def caption_search_window(width: int, height: int, style: dict[str, Any] | None) -> dict[str, Any]:
+    """Franja donde libass pinta el estilo, para muestrear el frame ya quemado.
+
+    Misma ancla que ``build_ass``: ``bottom`` apoya el texto en MarginV desde
+    abajo (crece hacia arriba), ``top`` desde arriba, y ``middle``/``center``
+    (alineación 5) ignoran MarginV y quedan centrados. La región cubre unas
+    dos líneas; el detector se desliza dentro con una ventana de una línea.
+    """
+    src = style if isinstance(style, dict) else {}
+    visual = resolve_caption_style(src)
+    try:
+        size = int(src.get("size") or round(height * 0.038))
+    except (TypeError, ValueError):
+        size = round(height * 0.038)
+    size = max(8, min(int(size), max(8, height)))
+    if src.get("margin_v") is None:
+        margin_v = round(height * 0.22)
+    else:
+        try:
+            margin_v = int(src.get("margin_v"))
+        except (TypeError, ValueError):
+            margin_v = round(height * 0.22)
+    outline = int(visual.get("outline") or 6)
+    shadow = int(visual.get("shadow") or 0)
+    position = str(src.get("position") or "bottom").strip().lower()
+    if position not in {"bottom", "top", "middle", "center"}:
+        position = "bottom"
+    line_h = max(16, min(height, int(size + outline * 3 + shadow + 8)))
+    region_h = max(line_h, min(height, int(line_h * 2.6)))
+    pad = outline * 2
+    if position in {"middle", "center"}:
+        y = max(0, (height - region_h) // 2)
+    elif position == "top":
+        y = max(0, min(height - region_h, margin_v - pad))
+    else:
+        text_bottom = height - margin_v + pad
+        y = max(0, min(height - region_h, text_bottom - region_h))
+    return {
+        "position": position,
+        "x": 0,
+        "y": int(y),
+        "w": int(width),
+        "h": int(region_h),
+        "line_h": int(line_h),
+        # Horizontal slice. Short centered words fill ~40% of the width;
+        # a full-width average dilutes them under the visibility floor.
+        "win_frac": 0.40,
+    }
+
+
 def caption_events(segments: list[dict[str, Any]], *, max_words: int = 4, duration: float | None = None,
                    dictionary: Iterable[str] = ()) -> list[tuple[float, float, str]]:
     """(start, end, text) por línea corta. Usa `words` si vienen; si no, reparte el segmento."""

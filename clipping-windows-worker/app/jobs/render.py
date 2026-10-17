@@ -46,7 +46,7 @@ def logo_request(url: str, *, api_base_url: str, api_token: str) -> tuple[str, d
     if base and api_token and full.startswith(base + "/worker/"):
         headers["Authorization"] = f"Bearer {api_token}"
     return full, headers
-from app.tools.captions import write_ass
+from app.tools.captions import caption_search_window, write_ass
 from app.tools.enhance import enhance_decision, parse_enhance, run_enhance
 from app.tools.ffmpeg import FFmpegTool
 from app.tools.ffprobe import FFprobeTool
@@ -714,32 +714,87 @@ class RenderJob(BaseJob):
             return out
         bg_crop = f"200:100:40:{max(0, vh // 2)}"
         bg = self._yavg(video, min(1.0, duration / 2), bg_crop)
-        if bg is None:
-            return out
-        samples.append({"what": "background", "t": round(min(1.0, duration / 2), 3), "yavg": round(bg, 2)})
         wm = applied.get("watermark") or {}
-        if wm.get("applied"):
-            t = _sample_time(wm.get("start"), wm.get("end"), duration)
-            crop = self._logo_crop(video_w=vw, video_h=vh, logo=Path(str(watermark.get("file") or "")), watermark=watermark)
-            y = self._yavg(video, t, crop) if crop else None
-            if y is not None:
-                out["logo_visible"] = y > bg + 20
-                samples.append({"what": "logo", "t": round(t, 3), "yavg": round(y, 2), "crop": crop})
+        if bg is not None:
+            samples.append({"what": "background", "t": round(min(1.0, duration / 2), 3), "yavg": round(bg, 2)})
+            if wm.get("applied"):
+                t = _sample_time(wm.get("start"), wm.get("end"), duration)
+                crop = self._logo_crop(
+                    video_w=vw, video_h=vh, logo=Path(str(watermark.get("file") or "")), watermark=watermark,
+                )
+                y = self._yavg(video, t, crop) if crop else None
+                if y is not None:
+                    out["logo_visible"] = y > bg + 20
+                    samples.append({"what": "logo", "t": round(t, 3), "yavg": round(y, 2), "crop": crop})
         cap = applied.get("captions") or {}
         if cap.get("applied"):
-            segs = (payload.get("captions") or {}).get("segments") or []
-            if segs:
-                t = _sample_time(segs[0].get("start"), segs[0].get("end"), duration)
-            else:
-                t = min(1.0, max(0.05, duration / 2))
-            band_h = min(200, vh)
-            y0 = max(0, vh - 540) if vh > 540 else max(0, vh - band_h)
-            crop = f"{vw}:{band_h}:0:{y0}"
-            y = self._yavg(video, t, crop)
-            if y is not None:
-                out["captions_visible"] = y > bg + 1
-                samples.append({"what": "captions", "t": round(t, 3), "yavg": round(y, 2), "crop": crop})
+            self._check_captions(video, payload, probe_size=(vw, vh), duration=duration, out=out, samples=samples)
         return out
+
+    def _check_captions(
+        self,
+        video: Path,
+        payload: dict,
+        *,
+        probe_size: tuple[int, int],
+        duration: float,
+        out: dict[str, Any],
+        samples: list[dict],
+    ) -> None:
+        """Set captions_visible from local contrast, or omit it when sampling is invalid.
+
+        The old check compared the mean luma of a fixed bottom band with a
+        patch in the middle of the frame. A black outline on a light plate
+        pulls that mean *down*, so burned-in text was reported as missing.
+        Top and center styles were never inside the band, and only the first
+        segment was sampled. Contrast in the style's real window does not
+        depend on how light the plate is. No usable sample leaves the key
+        unset (the VPS then falls back to metadata) instead of defaulting
+        to false.
+        """
+        vw, vh = probe_size
+        style = ((payload.get("captions") or {}).get("style") or {})
+        window = caption_search_window(vw, vh, style if isinstance(style, dict) else {})
+        segments = (payload.get("captions") or {}).get("segments") or []
+        times = caption_sample_times(segments, duration)
+        if not times:
+            return
+        scores: list[tuple[float, float]] = []
+        control_y = _control_band_y(vh, int(window["y"]), int(window["h"]))
+        for t in times:
+            gray = self._gray_frame(video, t, vw, vh)
+            if gray is None:
+                continue
+            cap_score = _best_stroke(
+                gray, y=int(window["y"]), region_h=int(window["h"]),
+                line_h=int(window["line_h"]), win_frac=float(window["win_frac"]),
+            )
+            if cap_score is None:
+                continue
+            ctrl_score = None
+            if control_y is not None:
+                ctrl_score = _best_stroke(
+                    gray, y=control_y, region_h=int(window["h"]),
+                    line_h=int(window["line_h"]), win_frac=float(window["win_frac"]),
+                )
+            sample = {
+                "what": "captions",
+                "t": round(t, 3),
+                "position": window["position"],
+                "band": f"{vw}:{window['h']}:0:{window['y']}",
+                "score": round(cap_score, 3),
+            }
+            if ctrl_score is not None:
+                sample["control"] = round(ctrl_score, 3)
+                scores.append((cap_score, ctrl_score))
+            else:
+                scores.append((cap_score, 0.0))
+            samples.append(sample)
+        if not scores:
+            return
+        out["captions_visible"] = any(
+            _caption_contrast_visible(cap, ctrl) for cap, ctrl in scores
+        )
 
     def _logo_crop(self, *, video_w: int, video_h: int, logo: Path, watermark: dict) -> str | None:
         lw = int(watermark.get("width") or 180)
@@ -773,6 +828,29 @@ class RenderJob(BaseJob):
             if st.get("width") and st.get("height"):
                 return int(st["width"]), int(st["height"])
         return (0, 0)
+
+    def _gray_frame(self, video: Path, t: float, width: int, height: int):
+        """One gray frame at `t`, or None when ffmpeg does not return width*height bytes."""
+        import subprocess
+
+        ffmpeg = self.settings.ffmpeg_path or "ffmpeg"
+        try:
+            proc = subprocess.run(
+                [ffmpeg, "-v", "error", "-ss", f"{t:.3f}", "-i", str(video), "-frames:v", "1",
+                 "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                capture_output=True, timeout=60, check=False,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        raw = proc.stdout or b""
+        if proc.returncode != 0 or len(raw) != width * height:
+            return None
+        try:
+            import numpy as np
+        except ImportError:
+            return None
+        # copy: frombuffer only borrows `raw`, which dies with this frame.
+        return np.frombuffer(raw, dtype=np.uint8).reshape(height, width).copy()
 
     def _yavg(self, video: Path, t: float, crop: str) -> float | None:
         import subprocess
@@ -833,6 +911,130 @@ class RenderJob(BaseJob):
             if candidate.exists():
                 return candidate
         return candidates[0]
+
+
+# A block whose luma range crosses this gap is a stroke (fill against outline
+# or plate). Tuned on synthetic burns: a real caption line sits well above
+# 0.10, flat plates sit at 0, and testsrc without text stays under the floor
+# or under its own control band.
+_CAPTION_SCORE_MIN = 0.10
+_CAPTION_SCORE_MARGIN = 0.05
+
+
+def _caption_contrast_visible(score: float, control: float) -> bool:
+    """True when the caption window is a stroke and busier than the control band."""
+    return score >= _CAPTION_SCORE_MIN and score >= control + _CAPTION_SCORE_MARGIN
+
+
+def _control_band_y(height: int, caption_y: int, region_h: int) -> int | None:
+    """Same-sized band that does not overlap the caption window, if one fits."""
+    above = caption_y - region_h - 4
+    if above >= 0:
+        return above
+    below = caption_y + region_h + 4
+    if below + region_h <= height:
+        return below
+    return None
+
+
+def _best_stroke(gray, *, y: int, region_h: int, line_h: int, win_frac: float) -> float | None:
+    """Max fraction of high-range blocks in a sliding window inside the band."""
+    if gray is None:
+        return None
+    height, width = gray.shape
+    if line_h > height or width < 16:
+        return None
+    win_w = max(16, min(width, int(width * win_frac)))
+    step_y = max(2, line_h // 5)
+    step_x = max(4, win_w // 5)
+    y0 = max(0, min(int(y), height - line_h))
+    y1 = min(height - line_h, y0 + max(0, int(region_h) - line_h))
+    best = 0.0
+    for yy in range(y0, y1 + 1, step_y):
+        row = gray[yy:yy + line_h]
+        for xx in range(0, width - win_w + 1, step_x):
+            best = max(best, _window_stroke(row[:, xx:xx + win_w]))
+    return best
+
+
+def _window_stroke(band, *, block: int = 8, gap: int = 110) -> float:
+    import numpy as np
+
+    height, width = band.shape
+    rows, cols = height // block, width // block
+    if rows < 1 or cols < 1:
+        return 0.0
+    view = band[: rows * block, : cols * block].astype(np.int16)
+    view = view.reshape(rows, block, cols, block)
+    span = view.max(axis=(1, 3)) - view.min(axis=(1, 3))
+    return float((span >= gap).mean())
+
+
+def caption_sample_times(segments, duration: float, limit: int = 3) -> list[float]:
+    """Up to `limit` instants spread over the segments, inside real words when present.
+
+    The midpoint of a long segment often lands in a pause between words. Sampling
+    only that first midpoint was a false negative even when later lines were burned.
+    """
+    if duration <= 0:
+        return []
+    times: list[float] = []
+    for seg in segments or []:
+        if not isinstance(seg, dict):
+            continue
+        t = _segment_hit_time(seg, duration)
+        if t is None:
+            continue
+        if times and abs(times[-1] - t) < 0.05:
+            continue
+        times.append(t)
+    if len(times) <= limit:
+        return times
+    indexes = [0, len(times) // 2, len(times) - 1]
+    picked: list[float] = []
+    for i in indexes[:limit]:
+        t = times[i]
+        if not picked or abs(picked[-1] - t) >= 0.05:
+            picked.append(t)
+    return picked
+
+
+def _segment_hit_time(seg: dict, duration: float) -> float | None:
+    words = [
+        w for w in (seg.get("words") or [])
+        if isinstance(w, dict) and "start" in w and "end" in w
+    ]
+    if words:
+        word = words[len(words) // 2]
+        try:
+            start = float(word["start"])
+            end = float(word["end"])
+        except (TypeError, ValueError):
+            start = end = None
+        if start is not None and end is not None:
+            if end < start:
+                start, end = end, start
+            hit = _clamp_inside((start + end) / 2.0, start, end, duration)
+            if hit is not None:
+                return hit
+    try:
+        start = 0.0 if seg.get("start") is None else float(seg.get("start"))
+        end = duration if seg.get("end") is None else float(seg.get("end"))
+    except (TypeError, ValueError):
+        return None
+    if end < start:
+        start, end = 0.0, duration
+    if end - start < 0.05:
+        return None
+    return _clamp_inside((start + end) / 2.0, start, end, duration)
+
+
+def _clamp_inside(mid: float, start: float, end: float, duration: float) -> float | None:
+    lo = max(0.05, start)
+    hi = min(duration - 0.05, end)
+    if hi < lo:
+        return None
+    return min(max(mid, lo), hi)
 
 
 def _sample_time(start, end, duration: float) -> float:
