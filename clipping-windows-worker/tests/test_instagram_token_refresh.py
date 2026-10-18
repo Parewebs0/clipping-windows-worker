@@ -18,6 +18,7 @@ from app.models.job import Job
 from app.services.instagram_upload import (
     GRAPH_FACEBOOK,
     GRAPH_INSTAGRAM,
+    _token_fingerprint,
     prepare_instagram_token,
     resolve_auth,
     resolve_graph_version,
@@ -82,6 +83,7 @@ def _no_real_http(monkeypatch):
         raise AssertionError("real httpx.Client is disabled in these tests")
 
     monkeypatch.setattr("app.services.instagram_upload.httpx.Client", boom)
+    monkeypatch.setattr("app.services.instagram_upload._missing_facebook_app_warned", False)
     monkeypatch.delenv("INSTAGRAM_AUTH", raising=False)
     monkeypatch.delenv("INSTAGRAM_GRAPH_VERSION", raising=False)
     monkeypatch.delenv("INSTAGRAM_APP_ID", raising=False)
@@ -335,7 +337,18 @@ def test_token_under_7_days_refreshes_persists_and_upload_uses_new(tmp_path, mon
     assert path.name == "instagram_default.json"
     assert (path.stat().st_mode & 0o777) == 0o600
     assert APP_SECRET not in path.read_text(encoding="utf-8")
+    assert stored["seed"] == _token_fingerprint(OLD)
     assert warnings == []
+    again = prepare_instagram_token(
+        access_token=OLD,
+        working_directory=tmp_path,
+        now=NOW,
+        app_id=APP_ID,
+        app_secret=APP_SECRET,
+        client=client,
+    )
+    assert again == NEW
+    assert len(_refresh_calls(client)) == 1
 
 
 def test_unknown_expiry_uses_debug_token_and_skips_refresh_when_fresh(tmp_path, monkeypatch) -> None:
@@ -436,16 +449,92 @@ def test_refresh_exception_text_is_not_logged(tmp_path, warnings) -> None:
     assert warnings[0][1]["error"] == "RuntimeError"
 
 
-def test_facebook_missing_app_secret_warns_and_does_not_call(tmp_path, monkeypatch, warnings) -> None:
+def test_facebook_missing_app_secret_skips_refresh_and_warns_once(tmp_path, monkeypatch, warnings) -> None:
     _seed(tmp_path, "default", OLD, _iso(timedelta(days=1)))
     client = _patch(monkeypatch, _upload_handler())
     _upload(tmp_path, app_id="", app_secret=None)
-    # app_secret=None falls through to the (unset) env var, so it stays empty.
+    _upload(tmp_path, app_id="", app_secret="")
     assert _refresh_calls(client) == []
     assert _debug_calls(client) == []
     assert _create_calls(client)[0]["headers"]["Authorization"] == f"Bearer {OLD}"
-    assert warnings[0][1]["error"] == "INSTAGRAM_APP_ID or INSTAGRAM_APP_SECRET unset"
-    _assert_no_secrets(warnings[0][0] + " " + json.dumps(warnings[0][1]))
+    assert _create_calls(client)[1]["headers"]["Authorization"] == f"Bearer {OLD}"
+    assert len(warnings) == 1
+    message, fields = warnings[0]
+    assert "INSTAGRAM_APP_ID" in message and "INSTAGRAM_APP_SECRET" in message
+    assert "skipped" in message
+    assert fields["auth"] == "facebook"
+    assert "error" not in fields
+    _assert_no_secrets(message + " " + json.dumps(fields))
+
+
+def test_fresh_token_with_missing_facebook_app_does_not_warn(tmp_path, warnings) -> None:
+    _seed(tmp_path, "default", OLD, _iso(timedelta(days=30)))
+    client = FakeClient(_upload_handler())
+    token = prepare_instagram_token(
+        access_token=OLD,
+        working_directory=tmp_path,
+        now=NOW,
+        app_id="",
+        app_secret="",
+        client=client,
+    )
+    assert token == OLD
+    assert client.calls == []
+    assert warnings == []
+
+
+def test_changed_env_token_discards_saved_token(tmp_path, monkeypatch) -> None:
+    save_oauth_state(
+        tmp_path,
+        "instagram",
+        "default",
+        {
+            "access_token": "persisted-token",
+            "expires_at": _iso(timedelta(days=30)),
+            "seed": _token_fingerprint(OLD),
+        },
+    )
+    far = int((NOW + timedelta(days=40)).timestamp())
+    client = _patch(monkeypatch, _upload_handler(debug_expires=far))
+    token = prepare_instagram_token(
+        access_token="rotated-env-token",
+        working_directory=tmp_path,
+        now=NOW,
+        app_id=APP_ID,
+        app_secret=APP_SECRET,
+        client=client,
+    )
+    assert token == "rotated-env-token"
+    assert _debug_calls(client)[0]["params"]["input_token"] == "rotated-env-token"
+    assert _refresh_calls(client) == []
+    stored = load_oauth_state(tmp_path, "instagram", "default")
+    assert stored["access_token"] == "rotated-env-token"
+    assert stored["seed"] == _token_fingerprint("rotated-env-token")
+    assert "persisted-token" not in json.dumps(stored)
+
+
+def test_matching_env_seed_keeps_saved_token(tmp_path) -> None:
+    save_oauth_state(
+        tmp_path,
+        "instagram",
+        "default",
+        {
+            "access_token": "persisted-token",
+            "expires_at": _iso(timedelta(days=30)),
+            "seed": _token_fingerprint(OLD),
+        },
+    )
+    client = FakeClient(_upload_handler())
+    token = prepare_instagram_token(
+        access_token=OLD,
+        working_directory=tmp_path,
+        now=NOW,
+        app_id=APP_ID,
+        app_secret=APP_SECRET,
+        client=client,
+    )
+    assert token == "persisted-token"
+    assert client.calls == []
 
 
 def test_instagram_login_uses_graph_instagram_refresh(tmp_path, monkeypatch) -> None:

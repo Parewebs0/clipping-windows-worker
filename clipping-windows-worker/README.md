@@ -104,7 +104,7 @@ copy .env.example .env
 | `INSTAGRAM_GRAPH_VERSION` | Versión de Graph API en las URLs de publicación y de refresco `facebook` | `v21.0` |
 | `TIKTOK_ACCESS_TOKEN` / `TIKTOK_PRIVACY` | Content Posting API | — / `SELF_ONLY` |
 
-El token de larga duración dura unos 60 días. Antes de subir, si quedan menos de 7 días (o no hay fecha), el worker lo renueva y guarda token + caducidad en `<WORKING_DIRECTORY>/oauth_state/instagram_<cuenta>.json` (modo `0600`). No subas esa carpeta a git. A partir de ahí el fichero manda: si pegas un token nuevo en `.env`, borra el json de esa cuenta para que el worker lo coja. Si el refresco falla, la subida sigue con el token actual y queda un WARNING en el log (sin el token ni el secret).
+El token de larga duración dura unos 60 días. Antes de subir, si quedan menos de 7 días (o no hay fecha), el worker lo renueva y guarda token + caducidad en `<WORKING_DIRECTORY>/oauth_state/instagram_<cuenta>.json` (modo `0600`). No subas esa carpeta a git. Si cambias el token en `.env`, ese json deja de usarse. En modo `facebook` hacen falta `INSTAGRAM_APP_ID` y `INSTAGRAM_APP_SECRET`; si faltan, no se intenta el refresco y el aviso sale una sola vez. Si el refresco falla por otro motivo, la subida sigue con el token actual y queda un WARNING en el log (sin el token ni el secret).
 
 > **Seguridad:** nunca subas `.env` a Git. Usa `.env.example` como plantilla.
 

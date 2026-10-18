@@ -6,6 +6,7 @@ token and its expiry are stored in ``<working_directory>/oauth_state/``.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -17,7 +18,7 @@ from typing import Any
 
 import httpx
 
-from app.services.oauth_state import load_oauth_state, save_oauth_state, slug
+from app.services.oauth_state import load_oauth_state, oauth_state_path, save_oauth_state, slug
 from app.utils.logging import get_logger
 
 GRAPH_FACEBOOK = "https://graph.facebook.com"
@@ -27,6 +28,8 @@ REFRESH_WITHIN = timedelta(days=7)
 _VERSION_RE = re.compile(r"v\d+(?:\.\d+)?")
 
 logger = get_logger("instagram_upload")
+# Missing Facebook app credentials are a config problem, not a per-upload failure.
+_missing_facebook_app_warned = False
 
 
 class InstagramTokenRefreshError(RuntimeError):
@@ -118,6 +121,35 @@ def _public_error(exc: BaseException) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         return f"HTTP {exc.response.status_code}"
     return type(exc).__name__
+
+
+def _token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _warn_missing_facebook_app_once(account: str) -> None:
+    """One WARNING per process when facebook refresh cannot run."""
+    global _missing_facebook_app_warned
+    if _missing_facebook_app_warned:
+        return
+    _missing_facebook_app_warned = True
+    logger.warning(
+        "instagram token refresh skipped; INSTAGRAM_APP_ID or INSTAGRAM_APP_SECRET unset",
+        account=account,
+        auth="facebook",
+    )
+
+
+def _discard_stored_token(working_directory: Path | str, account: str) -> None:
+    path = oauth_state_path(working_directory, "instagram", account)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return
+    logger.info(
+        "instagram oauth state ignored; the env access token changed",
+        account=account,
+    )
 
 
 def _warn_refresh_failed(
@@ -252,21 +284,24 @@ def _persist(
     token: str,
     expires_at: datetime | None,
     now: datetime,
+    seed: str | None,
 ) -> None:
-    """Save the token. A disk error must not abort the upload."""
+    """Save the token. A disk error must not abort the upload.
+
+    ``seed`` is the fingerprint of the env token this file was issued for.
+    A later env token with a different fingerprint replaces the file.
+    """
+    payload: dict[str, Any] = {
+        "provider": "instagram",
+        "account": account,
+        "access_token": token,
+        "expires_at": expires_at.astimezone(timezone.utc).isoformat() if expires_at else None,
+        "updated_at": now.astimezone(timezone.utc).isoformat(),
+    }
+    if seed:
+        payload["seed"] = seed
     try:
-        save_oauth_state(
-            working_directory,
-            "instagram",
-            account,
-            {
-                "provider": "instagram",
-                "account": account,
-                "access_token": token,
-                "expires_at": expires_at.astimezone(timezone.utc).isoformat() if expires_at else None,
-                "updated_at": now.astimezone(timezone.utc).isoformat(),
-            },
-        )
+        save_oauth_state(working_directory, "instagram", account, payload)
     except Exception as exc:  # noqa: BLE001 — the upload can still use the in-memory token
         logger.warning(
             "instagram oauth state was not saved",
@@ -289,11 +324,14 @@ def prepare_instagram_token(
 ) -> str:
     """Return the token an upload should use, refreshing it when required.
 
-    A persisted token wins over ``access_token`` (the env value is the seed;
-    the file holds the last renewal). When no expiry is known and
-    ``auth=facebook``, expiry is read with ``debug_token`` before deciding.
-    A failed refresh is logged at WARNING without secrets and the current
-    token is returned so the upload still runs.
+    A persisted token is the last renewal of the env token recorded in
+    ``seed``. When that env token changes, the file is ignored. When no
+    expiry is known and ``auth=facebook``, expiry is read with
+    ``debug_token`` before deciding. Facebook refresh needs
+    ``INSTAGRAM_APP_ID`` and ``INSTAGRAM_APP_SECRET``; if either is missing
+    the refresh is skipped and a single WARNING is logged. Any other failed
+    refresh is logged at WARNING without secrets and the current token is
+    returned so the upload still runs.
     """
     current = _utcnow(now)
     mode = resolve_auth(auth)
@@ -302,19 +340,32 @@ def prepare_instagram_token(
     resolved_app_id = _optional_setting(app_id, "INSTAGRAM_APP_ID")
     resolved_app_secret = _optional_setting(app_secret, "INSTAGRAM_APP_SECRET")
     env_token = (access_token or "").strip()
+    env_fp = _token_fingerprint(env_token) if env_token else ""
 
     token = env_token
     expires_at: datetime | None = None
+    stored_seed = ""
     if working_directory is not None:
         stored = load_oauth_state(working_directory, "instagram", account)
         if stored:
             stored_token = str(stored.get("access_token") or "").strip()
-            if stored_token:
+            stored_seed = str(stored.get("seed") or "").strip()
+            rotated = bool(
+                stored_token
+                and stored_seed
+                and env_fp
+                and env_fp != stored_seed
+                and env_fp != _token_fingerprint(stored_token)
+            )
+            if rotated:
+                _discard_stored_token(working_directory, account)
+            elif stored_token:
                 token = stored_token
-            expires_at = _parse_expires(stored.get("expires_at"))
+                expires_at = _parse_expires(stored.get("expires_at"))
 
     if not token:
         return ""
+    seed = env_fp or stored_seed or None
 
     owns_client = client is None
     http = client or httpx.Client(timeout=30.0)
@@ -331,9 +382,13 @@ def prepare_instagram_token(
             if learned is not None:
                 expires_at = learned
                 if working_directory is not None and not _needs_refresh(expires_at, current):
-                    _persist(working_directory, account, token, expires_at, current)
+                    _persist(working_directory, account, token, expires_at, current, seed)
 
         if not _needs_refresh(expires_at, current):
+            return token
+
+        if mode == "facebook" and (not resolved_app_id or not resolved_app_secret):
+            _warn_missing_facebook_app_once(account)
             return token
 
         try:
@@ -364,7 +419,7 @@ def prepare_instagram_token(
                 now=current,
             )
         if working_directory is not None:
-            _persist(working_directory, account, renewed, new_expires, current)
+            _persist(working_directory, account, renewed, new_expires, current, seed)
         return renewed
     finally:
         if owns_client:
