@@ -103,6 +103,25 @@ copy .env.example .env
 
 > **Seguridad:** nunca subas `.env` a Git. Usa `.env.example` como plantilla.
 
+Otras cuentas usan el mismo nombre de variable más `_` y la clave en mayúsculas, leída del entorno del proceso (igual que el job `publish`): `yt2` → `YOUTUBE_CLIENT_ID_YT2`, `YOUTUBE_CLIENT_SECRET_YT2`, `YOUTUBE_REFRESH_TOKEN_YT2`. Instagram: `INSTAGRAM_ACCESS_TOKEN_IG2`, `INSTAGRAM_IG_USER_ID_IG2`. TikTok: `TIKTOK_ACCESS_TOKEN_STUDIO`.
+
+## Comprobar credenciales (sin publicar)
+
+`scripts/check_publish_creds.py` hace una llamada de solo lectura por plataforma. No sube ni publica nada, y no imprime tokens: si falta una variable, el motivo es el nombre (`YOUTUBE_REFRESH_TOKEN missing`).
+
+```bash
+python scripts/check_publish_creds.py
+python scripts/check_publish_creds.py --platform youtube --account default
+python scripts/check_publish_creds.py --platform instagram --account ig2
+python scripts/check_publish_creds.py --platform tiktok --account studio
+```
+
+`--platform` es `all` (por defecto), `youtube`, `instagram` o `tiktok`. `--account` es `default` si no se indica. Cada línea es `plataforma cuenta OK|FAIL motivo`. El proceso sale con 0 si todas están OK y con 1 si alguna falla.
+
+`default` usa `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` / `YOUTUBE_REFRESH_TOKEN` (y los equivalentes de Instagram y TikTok). Otra cuenta lee solo las variables con sufijo. En el job `publish`, si el override no está, se usan las credenciales `default`. El script no hace ese fallback: si falta `YOUTUBE_REFRESH_TOKEN_YT2`, falla sin llamar a la red, para no dar un OK de la cuenta equivocada.
+
+YouTube refresca el token (sin pedir scopes de más) y llama a `channels.list(part=snippet, mine=true)`. Imprime el título del canal, si el token incluye `youtube.upload` y, si está, `yt-analytics.readonly`. Instagram hace `GET /{ig-user-id}?fields=username,account_type` y exige `BUSINESS`, `CREATOR` o `MEDIA_CREATOR`. TikTok hace `POST /v2/post/publish/creator_info/query/` e imprime el username y `privacy_level_options`.
+
 ---
 
 ## Ejecución

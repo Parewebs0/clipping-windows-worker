@@ -18,6 +18,11 @@ from app.services.publish_state import PublishStateStore
 from app.utils.clip_storage import ClipStorage, ClipStorageError
 
 
+def _account_key(account_key: str) -> str:
+    """Normalise ``payload.account`` into an env suffix (``ig2`` → ``IG2``)."""
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(account_key or "default")).strip("_").upper()
+
+
 def _account_env(settings, base_field: str, account_key: str) -> str:
     """Credential for one account (MOLI-53).
 
@@ -25,7 +30,7 @@ def _account_env(settings, base_field: str, account_key: str) -> str:
     single-account field, so old deployments work unchanged. Other keys read
     ``<BASE_FIELD>_<KEY>`` from the environment, e.g.
     ``INSTAGRAM_ACCESS_TOKEN_IG2`` for account key ``ig2``."""
-    key = re.sub(r"[^A-Za-z0-9]+", "_", str(account_key or "default")).strip("_").upper()
+    key = _account_key(account_key)
     override = ""
     if key and key != "DEFAULT":
         override = (os.environ.get(f"{base_field.upper()}_{key}") or "").strip()
@@ -100,18 +105,19 @@ class PublishJob(BaseJob):
         if platform == "youtube":
             from app.services.youtube_upload import upload_short
 
+            account = str(payload.get("account") or "default")
             uploaded = upload_short(
                 file_path=dest,
                 title=str(title),
                 description=str(caption),
-                client_id=getattr(self.settings, "youtube_client_id", None) or "",
-                client_secret=getattr(self.settings, "youtube_client_secret", None) or "",
-                refresh_token=getattr(self.settings, "youtube_refresh_token", None) or "",
+                client_id=_account_env(self.settings, "youtube_client_id", account),
+                client_secret=_account_env(self.settings, "youtube_client_secret", account),
+                refresh_token=_account_env(self.settings, "youtube_refresh_token", account),
                 privacy=getattr(self.settings, "youtube_privacy", None) or "private",
                 paid_promotion=bool(payload.get("paid_promotion")),
             )
             post_url = uploaded["post_url"]
-            extra = {"video_id": uploaded.get("video_id")}
+            extra = {"video_id": uploaded.get("video_id"), "account": account}
         elif platform == "instagram":
             from app.services.instagram_upload import upload_reel
 

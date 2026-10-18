@@ -127,6 +127,59 @@ def test_default_account_uses_legacy_credentials(tmp_path, fake_uploaders):
     assert kwargs["ig_user_id"] == "111"
 
 
+def test_youtube_default_account_uses_settings_credentials(tmp_path, fake_uploaders):
+    _pending_clip(tmp_path)
+    out = PublishJob(
+        _settings(tmp_path),
+        _job(platform="youtube", payload_extra={"account": "default"}),
+    ).execute()
+    kwargs = fake_uploaders["youtube"].call_args.kwargs
+    assert kwargs["client_id"] == "cid"
+    assert kwargs["client_secret"] == "secret"
+    assert kwargs["refresh_token"] == "rt"
+    pub = out["publications"][0]
+    assert pub["account"] == "default"
+    assert pub["video_id"] == "VID1"
+
+
+def test_youtube_omitted_account_matches_default(tmp_path, fake_uploaders):
+    _pending_clip(tmp_path)
+    out = PublishJob(_settings(tmp_path), _job(platform="youtube")).execute()
+    kwargs = fake_uploaders["youtube"].call_args.kwargs
+    assert kwargs["client_id"] == "cid"
+    assert kwargs["client_secret"] == "secret"
+    assert kwargs["refresh_token"] == "rt"
+    assert out["publications"][0]["account"] == "default"
+
+
+def test_youtube_yt2_reads_suffixed_env(tmp_path, fake_uploaders, monkeypatch):
+    monkeypatch.setenv("YOUTUBE_CLIENT_ID_YT2", "cid-yt2")
+    monkeypatch.setenv("YOUTUBE_CLIENT_SECRET_YT2", "secret-yt2")
+    monkeypatch.setenv("YOUTUBE_REFRESH_TOKEN_YT2", "rt-yt2")
+    _pending_clip(tmp_path)
+    out = PublishJob(
+        _settings(tmp_path),
+        _job(platform="youtube", payload_extra={"account": "yt2"}),
+    ).execute()
+    kwargs = fake_uploaders["youtube"].call_args.kwargs
+    assert kwargs["client_id"] == "cid-yt2"
+    assert kwargs["client_secret"] == "secret-yt2"
+    assert kwargs["refresh_token"] == "rt-yt2"
+    assert out["publications"][0]["account"] == "yt2"
+
+
+def test_youtube_unknown_account_falls_back_to_default(tmp_path, fake_uploaders):
+    _pending_clip(tmp_path)
+    out = PublishJob(
+        _settings(tmp_path),
+        _job(platform="youtube", payload_extra={"account": "ghost"}),
+    ).execute()
+    kwargs = fake_uploaders["youtube"].call_args.kwargs
+    assert kwargs["refresh_token"] == "rt"
+    assert kwargs["client_id"] == "cid"
+    assert out["publications"][0]["account"] == "ghost"
+
+
 def test_account_key_picks_override_env(tmp_path, fake_uploaders, monkeypatch):
     monkeypatch.setenv("INSTAGRAM_ACCESS_TOKEN_IG2", "tok-ig2")
     monkeypatch.setenv("INSTAGRAM_IG_USER_ID_IG2", "222")
