@@ -5,22 +5,30 @@
 init, chunked upload and status until ``PUBLISH_COMPLETE`` or ``FAILED``.
 
 Access tokens last about a day. When client key, secret and a refresh token
-are set, a cached token that expires in under 10 minutes is refreshed once
-and stored under ``<working_directory>/oauth_state/`` (mode 600). A static
-``TIKTOK_ACCESS_TOKEN`` with no expiry is used unchanged.
+are set, the token is refreshed once if its expiry is unknown or inside 10
+minutes, and a 401 refreshes once more and retries that request. The new
+token is stored via ``oauth_state`` (mode 600). An access token with no
+refresh material is used unchanged.
+
+A ``publish_id`` is written under ``tiktok_pending/`` after the bytes are
+uploaded. A retry polls that id instead of uploading again, so a status
+timeout cannot create a second direct post.
 """
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
+from app.services.oauth_state import slug
 from app.services.tiktok_oauth import known_secrets, resolve_access_token, scrub
 
 OPEN = "https://open.tiktokapis.com"
@@ -88,6 +96,41 @@ def build_post_url(username: str | None, post_id: str | None) -> str:
     return f"https://www.tiktok.com/@{user}"
 
 
+class _Auth:
+    """Bearer for one upload. A 401 may refresh the token a single time."""
+
+    def __init__(
+        self,
+        token: str,
+        secrets: list[str],
+        *,
+        can_refresh: bool,
+        refreshed: bool,
+        refresher: Callable[[], tuple[str, list[str], bool, bool]],
+    ) -> None:
+        self.token = token
+        self.secrets = secrets
+        self.can_refresh = can_refresh
+        self.refreshed = refreshed
+        self._refresher = refresher
+
+    def headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json; charset=UTF-8",
+        }
+
+    def retry_unauthorized(self) -> bool:
+        if self.refreshed or not self.can_refresh:
+            return False
+        token, secrets, _refreshed, can_refresh = self._refresher()
+        self.token = token
+        self.secrets = secrets
+        self.can_refresh = can_refresh
+        self.refreshed = True
+        return True
+
+
 def upload_video(
     *,
     file_path: Path,
@@ -101,7 +144,8 @@ def upload_video(
     client_key: str = "",
     client_secret: str = "",
     refresh_token: str = "",
-    oauth_state_dir: Path | None = None,
+    working_directory: Path | None = None,
+    clip_id: str | None = None,
     duration_sec: float | None = None,
     transport: httpx.BaseTransport | None = None,
     poll_interval: float = 5.0,
@@ -117,32 +161,69 @@ def upload_video(
     size = file_path.stat().st_size
     if size <= 0:
         raise RuntimeError("tiktok video file is empty")
+    pending = _load_pending(working_directory, account, clip_id)
+    # TikTok rejects a paid brand-content post that is only visible to the creator.
+    # Check before any request so a retry does not init a publish that will fail.
+    if pending is None and post_mode == "direct" and paid_promotion and privacy_level == "SELF_ONLY":
+        raise RuntimeError(
+            "tiktok paid promotion cannot use privacy_level SELF_ONLY "
+            "(brand_content_toggle is rejected); pick another privacy_level"
+        )
     client_kwargs: dict[str, Any] = {"timeout": 300.0, "follow_redirects": True}
     if transport is not None:
         client_kwargs["transport"] = transport
     with httpx.Client(**client_kwargs) as client:
-        token, secrets = resolve_access_token(
+        token, secrets, refreshed, can_refresh = resolve_access_token(
             account=account,
             access_token=access_token,
             client_key=client_key,
             client_secret=client_secret,
             refresh_token=refresh_token,
-            oauth_state_dir=oauth_state_dir,
+            working_directory=working_directory,
             client=client,
         )
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json; charset=UTF-8",
-        }
+
+        def _force() -> tuple[str, list[str], bool, bool]:
+            return resolve_access_token(
+                account=account,
+                access_token=access_token,
+                client_key=client_key,
+                client_secret=client_secret,
+                refresh_token=refresh_token,
+                working_directory=working_directory,
+                client=client,
+                force=True,
+            )
+
+        auth = _Auth(
+            token,
+            secrets,
+            can_refresh=can_refresh,
+            refreshed=refreshed,
+            refresher=_force,
+        )
+        if pending is not None:
+            return _resume(
+                client,
+                auth,
+                pending,
+                size=size,
+                privacy_level=privacy_level,
+                title=caption,
+                poll_interval=poll_interval,
+                max_polls=max_polls,
+                working_directory=working_directory,
+                account=account,
+                clip_id=clip_id,
+            )
         if post_mode == "direct":
             if duration_sec is None:
                 duration_sec = _probe_duration(file_path)
             return _direct(
                 client,
+                auth,
                 file_path=file_path,
                 size=size,
-                headers=headers,
-                secrets=secrets,
                 title=caption,
                 privacy_level=privacy_level,
                 paid_promotion=paid_promotion,
@@ -150,28 +231,32 @@ def upload_video(
                 duration_sec=duration_sec,
                 poll_interval=poll_interval,
                 max_polls=max_polls,
+                working_directory=working_directory,
+                account=account,
+                clip_id=clip_id,
             )
         return _inbox(
             client,
+            auth,
             file_path=file_path,
             size=size,
-            headers=headers,
-            secrets=secrets,
             title=caption,
             privacy_level=privacy_level,
             handle=handle,
             poll_interval=poll_interval,
             max_polls=max_polls,
+            working_directory=working_directory,
+            account=account,
+            clip_id=clip_id,
         )
 
 
 def _direct(
     client: httpx.Client,
+    auth: _Auth,
     *,
     file_path: Path,
     size: int,
-    headers: dict[str, str],
-    secrets: list[str],
     title: str,
     privacy_level: str,
     paid_promotion: bool,
@@ -179,13 +264,15 @@ def _direct(
     duration_sec: float | None,
     poll_interval: float,
     max_polls: int,
+    working_directory: Path | None,
+    account: str,
+    clip_id: str | None,
 ) -> dict:
     info = _post_json(
         client,
         f"{OPEN}/v2/post/publish/creator_info/query/",
-        headers,
+        auth,
         {},
-        secrets,
         "tiktok creator_info",
     )
     creator = info.get("data") or {}
@@ -211,7 +298,7 @@ def _direct(
     init = _post_json(
         client,
         f"{OPEN}/v2/post/publish/video/init/",
-        headers,
+        auth,
         {
             "post_info": {
                 "title": title,
@@ -230,54 +317,66 @@ def _direct(
                 "total_chunk_count": count,
             },
         },
-        secrets,
         "tiktok direct init",
     )
-    publish_id, upload_url = _upload_target(init, secrets, "tiktok direct missing upload_url")
-    _put_chunks(client, file_path, upload_url, size, chunk_size, count, secrets)
+    publish_id, upload_url = _upload_target(init, auth.secrets, "tiktok direct missing upload_url")
+    _put_chunks(client, file_path, upload_url, size, chunk_size, count, auth.secrets)
+    username = _username(creator.get("creator_username")) or _username(handle)
+    _save_pending(
+        working_directory,
+        account,
+        clip_id,
+        publish_id=publish_id,
+        mode="direct",
+        privacy_level=privacy_level,
+        title=title,
+        username=username,
+    )
     status, payload = _poll(
         client,
-        headers,
+        auth,
         publish_id,
         done=DIRECT_DONE,
         poll_interval=poll_interval,
         max_polls=max_polls,
     )
-    data = payload.get("data") or {}
-    if status == "FAILED":
-        raise RuntimeError(scrub(f"tiktok publish failed: {payload}", secrets))
-    if status != "PUBLISH_COMPLETE":
-        raise TimeoutError(scrub(f"tiktok status={status} publish_id={publish_id} {payload}", secrets))
-    username = _username(creator.get("creator_username")) or _username(handle)
-    return _result(
-        publish_id=publish_id,
+    return _conclude(
+        mode="direct",
         status=status,
+        payload=payload,
+        publish_id=publish_id,
+        secrets=auth.secrets,
         privacy_level=privacy_level,
         title=title,
         username=username,
-        data=data,
+        size=size,
+        working_directory=working_directory,
+        account=account,
+        clip_id=clip_id,
     )
 
 
 def _inbox(
     client: httpx.Client,
+    auth: _Auth,
     *,
     file_path: Path,
     size: int,
-    headers: dict[str, str],
-    secrets: list[str],
     title: str,
     privacy_level: str,
     handle: str | None,
     poll_interval: float,
     max_polls: int,
+    working_directory: Path | None,
+    account: str,
+    clip_id: str | None,
 ) -> dict:
     # Inbox ignores privacy_level. The value is only echoed in the result.
     chunk_size, count = plan_upload_chunks(size)
     init = _post_json(
         client,
         f"{OPEN}/v2/post/publish/inbox/video/init/",
-        headers,
+        auth,
         {
             "source_info": {
                 "source": "FILE_UPLOAD",
@@ -286,23 +385,120 @@ def _inbox(
                 "total_chunk_count": count,
             }
         },
-        secrets,
         "tiktok inbox init",
     )
-    publish_id, upload_url = _upload_target(init, secrets, "tiktok inbox missing upload_url")
-    _put_chunks(client, file_path, upload_url, size, chunk_size, count, secrets)
+    publish_id, upload_url = _upload_target(init, auth.secrets, "tiktok inbox missing upload_url")
+    _put_chunks(client, file_path, upload_url, size, chunk_size, count, auth.secrets)
+    username = _username(handle)
+    _save_pending(
+        working_directory,
+        account,
+        clip_id,
+        publish_id=publish_id,
+        mode="inbox",
+        privacy_level=privacy_level,
+        title=title,
+        username=username,
+    )
     status, payload = _poll(
         client,
-        headers,
+        auth,
         publish_id,
         done=INBOX_DONE,
         poll_interval=poll_interval,
         max_polls=max_polls,
     )
+    return _conclude(
+        mode="inbox",
+        status=status,
+        payload=payload,
+        publish_id=publish_id,
+        secrets=auth.secrets,
+        privacy_level=privacy_level,
+        title=title,
+        username=username,
+        size=size,
+        working_directory=working_directory,
+        account=account,
+        clip_id=clip_id,
+    )
+
+
+def _resume(
+    client: httpx.Client,
+    auth: _Auth,
+    pending: dict[str, Any],
+    *,
+    size: int,
+    privacy_level: str,
+    title: str,
+    poll_interval: float,
+    max_polls: int,
+    working_directory: Path | None,
+    account: str,
+    clip_id: str | None,
+) -> dict:
+    """Poll the publish that already received the video. Do not init or PUT."""
+    publish_id = str(pending.get("publish_id") or "").strip()
+    mode = str(pending.get("mode") or "inbox")
+    if mode not in {"inbox", "direct"}:
+        mode = "inbox"
+    done = DIRECT_DONE if mode == "direct" else INBOX_DONE
+    status, payload = _poll(
+        client,
+        auth,
+        publish_id,
+        done=done,
+        poll_interval=poll_interval,
+        max_polls=max_polls,
+    )
+    return _conclude(
+        mode=mode,
+        status=status,
+        payload=payload,
+        publish_id=publish_id,
+        secrets=auth.secrets,
+        privacy_level=str(pending.get("privacy_level") or privacy_level),
+        title=str(pending.get("title") or title),
+        username=str(pending.get("username") or ""),
+        size=size,
+        working_directory=working_directory,
+        account=account,
+        clip_id=clip_id,
+    )
+
+
+def _conclude(
+    *,
+    mode: str,
+    status: str,
+    payload: dict[str, Any],
+    publish_id: str,
+    secrets: list[str],
+    privacy_level: str,
+    title: str,
+    username: str,
+    size: int,
+    working_directory: Path | None,
+    account: str,
+    clip_id: str | None,
+) -> dict[str, Any]:
     data = payload.get("data") or {}
     if status == "FAILED":
+        # The publish is terminal and not public. A later attempt may upload again.
+        _clear_pending(working_directory, account, clip_id)
         raise RuntimeError(scrub(f"tiktok publish failed: {payload}", secrets))
-    username = _username(handle)
+    if mode == "direct":
+        if status != "PUBLISH_COMPLETE":
+            raise TimeoutError(scrub(f"tiktok status={status} publish_id={publish_id} {payload}", secrets))
+        return _result(
+            publish_id=publish_id,
+            status=status,
+            privacy_level=privacy_level,
+            title=title,
+            username=username,
+            data=data,
+        )
     if status not in INBOX_DONE:
         uploaded = data.get("uploaded_bytes")
         if uploaded == size or status in {"PROCESSING_UPLOAD", "PROCESSING_DOWNLOAD"}:
@@ -325,18 +521,109 @@ def _inbox(
     )
 
 
+def _pending_path(working_directory: Path, account: str, clip_id: str) -> Path:
+    name = f"{slug(account, fallback='default')}__{slug(clip_id, fallback='clip')}.json"
+    return Path(working_directory) / "tiktok_pending" / name
+
+
+def _load_pending(
+    working_directory: Path | None,
+    account: str,
+    clip_id: str | None,
+) -> dict[str, Any] | None:
+    if working_directory is None or not clip_id:
+        return None
+    path = _pending_path(working_directory, account, clip_id)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise RuntimeError(
+            f"unreadable tiktok pending publish for clip {slug(clip_id, fallback='clip')}"
+        ) from None
+    if not isinstance(data, dict) or not str(data.get("publish_id") or "").strip():
+        raise RuntimeError(
+            f"unreadable tiktok pending publish for clip {slug(clip_id, fallback='clip')}"
+        ) from None
+    return data
+
+
+def _save_pending(
+    working_directory: Path | None,
+    account: str,
+    clip_id: str | None,
+    *,
+    publish_id: str,
+    mode: str,
+    privacy_level: str,
+    title: str,
+    username: str,
+) -> None:
+    if working_directory is None or not clip_id:
+        return
+    path = _pending_path(working_directory, account, clip_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "publish_id": publish_id,
+        "mode": mode,
+        "privacy_level": privacy_level,
+        "title": title,
+        "username": username,
+        "uploaded": True,
+    }
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=True, separators=(",", ":"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _clear_pending(working_directory: Path | None, account: str, clip_id: str | None) -> None:
+    if working_directory is None or not clip_id:
+        return
+    path = _pending_path(working_directory, account, clip_id)
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _post_allowing_refresh(
+    client: httpx.Client,
+    url: str,
+    auth: _Auth,
+    body: dict[str, Any],
+    prefix: str,
+) -> httpx.Response:
+    try:
+        response = client.post(url, headers=auth.headers(), json=body)
+    except httpx.HTTPError:
+        raise RuntimeError(f"{prefix} request failed") from None
+    if response.status_code != 401 or not auth.retry_unauthorized():
+        return response
+    try:
+        return client.post(url, headers=auth.headers(), json=body)
+    except httpx.HTTPError:
+        raise RuntimeError(f"{prefix} request failed") from None
+
+
 def _post_json(
     client: httpx.Client,
     url: str,
-    headers: dict[str, str],
+    auth: _Auth,
     body: dict[str, Any],
-    secrets: list[str],
     prefix: str,
 ) -> dict[str, Any]:
-    try:
-        response = client.post(url, headers=headers, json=body)
-    except httpx.HTTPError:
-        raise RuntimeError(f"{prefix} request failed") from None
+    response = _post_allowing_refresh(client, url, auth, body, prefix)
     payload: dict[str, Any] = {}
     if response.content:
         try:
@@ -348,7 +635,7 @@ def _post_json(
     err = payload.get("error")
     code = err.get("code") if isinstance(err, dict) else err
     if response.status_code >= 400 or code not in (None, "ok", ""):
-        detail = scrub((response.text or "")[:800], secrets)
+        detail = scrub((response.text or "")[:800], auth.secrets)
         raise RuntimeError(f"{prefix} {response.status_code}: {detail}")
     return payload
 
@@ -404,7 +691,7 @@ def _put_chunks(
 
 def _poll(
     client: httpx.Client,
-    headers: dict[str, str],
+    auth: _Auth,
     publish_id: str,
     *,
     done: set[str],
@@ -414,14 +701,16 @@ def _poll(
     status = ""
     payload: dict[str, Any] = {}
     for _ in range(max_polls):
-        try:
-            response = client.post(
-                f"{OPEN}/v2/post/publish/status/fetch/",
-                headers=headers,
-                json={"publish_id": publish_id},
-            )
-        except httpx.HTTPError:
-            raise RuntimeError("tiktok status request failed") from None
+        response = _post_allowing_refresh(
+            client,
+            f"{OPEN}/v2/post/publish/status/fetch/",
+            auth,
+            {"publish_id": publish_id},
+            "tiktok status",
+        )
+        if response.status_code == 401:
+            detail = scrub((response.text or "")[:800], auth.secrets)
+            raise RuntimeError(f"tiktok status 401: {detail}")
         parsed: Any = {}
         if response.content:
             try:

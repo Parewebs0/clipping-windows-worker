@@ -14,7 +14,8 @@ import pytest
 from app.config import Settings
 from app.jobs.publish import PublishJob
 from app.models.job import Job
-from app.services.tiktok_oauth import TikTokOAuthStateError, TikTokOAuthStore
+from app.services.oauth_state import save_oauth_state
+from app.services.tiktok_oauth import TikTokOAuthStateError
 from app.services.tiktok_upload import (
     build_post_url,
     iter_chunk_ranges,
@@ -312,7 +313,7 @@ def test_large_upload_follows_the_chunk_plan(tmp_path, monkeypatch):
 def test_expiring_token_refreshes_once_and_persists_without_logging_secrets(tmp_path, capsys, caplog):
     video = _video(tmp_path)
     oauth_dir = tmp_path / "oauth_state"
-    TikTokOAuthStore(oauth_dir).save("studio", {
+    save_oauth_state(tmp_path, "tiktok", "studio", {
         "access_token": OLD_ACCESS,
         "refresh_token": OLD_REFRESH,
         "access_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
@@ -353,7 +354,7 @@ def test_expiring_token_refreshes_once_and_persists_without_logging_secrets(tmp_
         client_key=CLIENT_KEY,
         client_secret=CLIENT_SECRET,
         refresh_token="rft.ENVREFRESHSHOULDNOTWIN",
-        oauth_state_dir=oauth_dir,
+        working_directory=tmp_path,
         handle="studio",
         transport=transport,
         poll_interval=0,
@@ -381,7 +382,7 @@ def test_expiring_token_refreshes_once_and_persists_without_logging_secrets(tmp_
 def test_invalid_refresh_errors_without_secrets(tmp_path, capsys, caplog):
     video = _video(tmp_path)
     oauth_dir = tmp_path / "oauth_state"
-    TikTokOAuthStore(oauth_dir).save("default", {
+    save_oauth_state(tmp_path, "tiktok", "default", {
         "access_token": OLD_ACCESS,
         "refresh_token": OLD_REFRESH,
         "access_expires_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
@@ -404,7 +405,7 @@ def test_invalid_refresh_errors_without_secrets(tmp_path, capsys, caplog):
             client_key=CLIENT_KEY,
             client_secret=CLIENT_SECRET,
             refresh_token=OLD_REFRESH,
-            oauth_state_dir=oauth_dir,
+            working_directory=tmp_path,
             transport=httpx.MockTransport(handler),
             poll_interval=0,
         )
@@ -446,7 +447,7 @@ def test_refresh_without_a_static_access_token(tmp_path):
         client_key=CLIENT_KEY,
         client_secret=CLIENT_SECRET,
         refresh_token=OLD_REFRESH,
-        oauth_state_dir=oauth_dir,
+        working_directory=tmp_path,
         handle="studio",
         transport=httpx.MockTransport(handler),
         poll_interval=0,
@@ -479,7 +480,7 @@ def test_failed_put_does_not_echo_the_upload_token(tmp_path):
     assert "[redacted]" in str(raised.value)
 
 
-def test_static_access_token_is_not_refreshed(tmp_path):
+def test_access_token_without_refresh_material_is_used_as_is(tmp_path):
     video = _video(tmp_path)
     seen: list[str] = []
 
@@ -497,15 +498,54 @@ def test_static_access_token_is_not_refreshed(tmp_path):
         file_path=video,
         title="t",
         access_token="tok-static",
-        client_key=CLIENT_KEY,
-        client_secret=CLIENT_SECRET,
-        refresh_token=OLD_REFRESH,
-        oauth_state_dir=tmp_path / "oauth_state",
         transport=httpx.MockTransport(handler),
         poll_interval=0,
     )
     assert "/v2/oauth/token/" not in seen
     assert not (tmp_path / "oauth_state").exists()
+
+
+def test_static_access_token_with_unknown_expiry_refreshes_once(tmp_path):
+    """Env token, no saved file: expiry is unknown, so refresh before the upload."""
+    video = _video(tmp_path)
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/v2/oauth/token/":
+            body = request.content.decode()
+            assert "grant_type=refresh_token" in body
+            assert OLD_REFRESH in body
+            return httpx.Response(200, json={
+                "access_token": NEW_ACCESS,
+                "expires_in": 86400,
+                "refresh_token": NEW_REFRESH,
+                "token_type": "Bearer",
+            })
+        if request.url.host == "open.tiktokapis.com":
+            assert request.headers["authorization"] == f"Bearer {NEW_ACCESS}"
+        if request.url.path.endswith("/inbox/video/init/"):
+            return _ok({"publish_id": "p", "upload_url": "https://upload.test/v"})
+        if request.method == "PUT":
+            return httpx.Response(201)
+        return _ok({"status": "SEND_TO_USER_INBOX", "uploaded_bytes": video.stat().st_size})
+
+    upload_video(
+        file_path=video,
+        title="t",
+        access_token="tok-static-access",
+        client_key=CLIENT_KEY,
+        client_secret=CLIENT_SECRET,
+        refresh_token=OLD_REFRESH,
+        working_directory=tmp_path,
+        transport=httpx.MockTransport(handler),
+        poll_interval=0,
+    )
+    assert seen[0] == "/v2/oauth/token/"
+    saved = json.loads((tmp_path / "oauth_state" / "tiktok_default.json").read_text(encoding="utf-8"))
+    assert saved["access_token"] == NEW_ACCESS
+    assert saved["refresh_token"] == NEW_REFRESH
+    assert saved["access_expires_at"]
 
 
 def test_api_error_body_does_not_leak_the_access_token(tmp_path, capsys, caplog):
@@ -536,7 +576,7 @@ def test_corrupt_oauth_state_does_not_leak_the_file(tmp_path):
             file_path=_video(tmp_path),
             title="t",
             access_token="tok-static",
-            oauth_state_dir=oauth_dir,
+            working_directory=tmp_path,
             transport=httpx.MockTransport(lambda request: httpx.Response(500)),
             poll_interval=0,
         )
@@ -568,6 +608,172 @@ def test_title_is_capped_at_2200_utf16_units(tmp_path):
         poll_interval=0,
     )
     assert len(captured["post_info"]["title"].encode("utf-16-le")) // 2 == 2200
+
+
+def test_direct_status_timeout_retries_the_same_publish_id(tmp_path):
+    video = _video(tmp_path)
+    calls: list[str] = []
+    polls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url.path}")
+        if request.url.path.endswith("/creator_info/query/"):
+            return _ok({
+                "creator_username": "alice",
+                "privacy_level_options": ["PUBLIC_TO_EVERYONE", "SELF_ONLY"],
+                "max_video_post_duration_sec": 300,
+            })
+        if request.url.path.endswith("/video/init/"):
+            return _ok({"publish_id": "pub-keep", "upload_url": "https://upload.test/v"})
+        if request.method == "PUT":
+            return httpx.Response(201)
+        if request.url.path.endswith("/status/fetch/"):
+            assert json.loads(request.content)["publish_id"] == "pub-keep"
+            polls["n"] += 1
+            if polls["n"] == 1:
+                return _ok({"status": "PROCESSING_UPLOAD"})
+            return _ok({"status": "PUBLISH_COMPLETE", "publicaly_available_post_id": ["777"]})
+        return httpx.Response(500, text="unexpected")
+
+    common = dict(
+        file_path=video,
+        title="t",
+        access_token="tok-static",
+        mode="direct",
+        privacy_level="PUBLIC_TO_EVERYONE",
+        duration_sec=1,
+        handle="alice",
+        account="studio",
+        clip_id="clip-1",
+        working_directory=tmp_path,
+        transport=httpx.MockTransport(handler),
+        poll_interval=0,
+        max_polls=1,
+    )
+    with pytest.raises(TimeoutError, match="pub-keep"):
+        upload_video(**common)
+    pending = json.loads((tmp_path / "tiktok_pending" / "studio__clip-1.json").read_text(encoding="utf-8"))
+    assert pending["publish_id"] == "pub-keep"
+    assert pending["uploaded"] is True
+
+    result = upload_video(**common)
+    assert result["publish_id"] == "pub-keep"
+    assert result["post_url"] == "https://www.tiktok.com/@alice/video/777"
+    assert [item for item in calls if item.endswith("/video/init/")] == ["POST /v2/post/publish/video/init/"]
+    assert [item for item in calls if item.startswith("PUT ")] == ["PUT /v"]
+    assert calls.count("POST /v2/post/publish/creator_info/query/") == 1
+    assert polls["n"] == 2
+
+
+def test_failed_publish_clears_pending_so_the_next_attempt_can_upload(tmp_path):
+    video = _video(tmp_path)
+    inits = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/creator_info/query/"):
+            return _ok({
+                "creator_username": "alice",
+                "privacy_level_options": ["PUBLIC_TO_EVERYONE"],
+                "max_video_post_duration_sec": 300,
+            })
+        if request.url.path.endswith("/video/init/"):
+            inits["n"] += 1
+            return _ok({"publish_id": f"pub-{inits['n']}", "upload_url": "https://upload.test/v"})
+        if request.method == "PUT":
+            return httpx.Response(201)
+        if request.url.path.endswith("/status/fetch/"):
+            if inits["n"] == 1:
+                return _ok({"status": "FAILED", "fail_reason": "video_pull_failed"})
+            return _ok({"status": "PUBLISH_COMPLETE", "publicaly_available_post_id": ["888"]})
+        return httpx.Response(500, text="unexpected")
+
+    common = dict(
+        file_path=video,
+        title="t",
+        access_token="tok-static",
+        mode="direct",
+        privacy_level="PUBLIC_TO_EVERYONE",
+        duration_sec=1,
+        clip_id="clip-2",
+        working_directory=tmp_path,
+        handle="alice",
+        transport=httpx.MockTransport(handler),
+        poll_interval=0,
+        max_polls=1,
+    )
+    with pytest.raises(RuntimeError, match="tiktok publish failed"):
+        upload_video(**common)
+    assert not (tmp_path / "tiktok_pending" / "default__clip-2.json").exists()
+    result = upload_video(**common)
+    assert inits["n"] == 2
+    assert result["publish_id"] == "pub-2"
+
+
+def test_paid_promotion_with_self_only_fails_before_upload(tmp_path):
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(500, text="should not be called")
+
+    with pytest.raises(RuntimeError, match="SELF_ONLY") as raised:
+        upload_video(
+            file_path=_video(tmp_path),
+            title="t",
+            access_token="tok-static",
+            mode="direct",
+            privacy_level="SELF_ONLY",
+            paid_promotion=True,
+            duration_sec=1,
+            transport=httpx.MockTransport(handler),
+            poll_interval=0,
+        )
+    assert "brand_content_toggle" in str(raised.value)
+    assert seen == []
+
+
+def test_401_refreshes_once_and_retries_the_request(tmp_path, capsys, caplog):
+    video = _video(tmp_path)
+    save_oauth_state(tmp_path, "tiktok", "default", {
+        "access_token": OLD_ACCESS,
+        "refresh_token": OLD_REFRESH,
+        "access_expires_at": (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat(),
+    })
+    hits = {"refresh": 0, "init": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/oauth/token/":
+            hits["refresh"] += 1
+            assert OLD_REFRESH in request.content.decode()
+            return httpx.Response(200, json={
+                "access_token": NEW_ACCESS,
+                "expires_in": 86400,
+                "refresh_token": NEW_REFRESH,
+                "token_type": "Bearer",
+            })
+        if request.url.path.endswith("/inbox/video/init/"):
+            hits["init"] += 1
+            if request.headers["authorization"] == f"Bearer {OLD_ACCESS}":
+                return httpx.Response(401, text=f"unauthorized {OLD_ACCESS}")
+            assert request.headers["authorization"] == f"Bearer {NEW_ACCESS}"
+            return _ok({"publish_id": "p", "upload_url": "https://upload.test/v"})
+        if request.method == "PUT":
+            return httpx.Response(201)
+        return _ok({"status": "SEND_TO_USER_INBOX"})
+
+    upload_video(
+        file_path=video,
+        title="t",
+        access_token=OLD_ACCESS,
+        client_key=CLIENT_KEY,
+        client_secret=CLIENT_SECRET,
+        refresh_token=OLD_REFRESH,
+        working_directory=tmp_path,
+        transport=httpx.MockTransport(handler),
+        poll_interval=0,
+    )
+    assert hits == {"refresh": 1, "init": 2}
+    _assert_no_secrets(_capture(capsys, caplog))
 
 
 def test_publish_job_passes_direct_credentials_and_keeps_idempotency(tmp_path, monkeypatch):
@@ -620,7 +826,8 @@ def test_publish_job_passes_direct_credentials_and_keeps_idempotency(tmp_path, m
     assert kwargs["refresh_token"] == OLD_REFRESH
     assert kwargs["access_token"] == "tok-default"
     assert kwargs["privacy_level"] == "PUBLIC_TO_EVERYONE"
-    assert kwargs["oauth_state_dir"] == tmp_path / "data" / "oauth_state"
+    assert kwargs["working_directory"] == tmp_path / "data"
+    assert kwargs["clip_id"] == clip_id
     assert kwargs["title"] == "copy @clipeand22"
     assert out["publications"][0]["post_url"] == "https://www.tiktok.com/@alice/video/99"
     assert out["publications"][0]["post_id"] == "99"

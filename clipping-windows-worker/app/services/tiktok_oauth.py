@@ -1,33 +1,29 @@
-"""TikTok user-token refresh. Tokens live in oauth_state, never in .env or logs."""
+"""TikTok user-token refresh. Tokens live in oauth_state, never in .env or logs.
+
+The file itself is the shared store from ``oauth_state.py`` (one JSON per
+provider and account). This module only decides when to refresh.
+"""
 from __future__ import annotations
 
-import json
-import os
 import re
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from app.services.oauth_state import load_oauth_state, oauth_state_path, save_oauth_state, slug
 from app.utils.logging import get_logger
 
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 logger = get_logger("tiktok_oauth")
 REFRESH_SKEW = timedelta(minutes=10)
-_SLUG = re.compile(r"[^A-Za-z0-9._-]+")
 _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_PROVIDER = "tiktok"
 
 
 class TikTokOAuthStateError(RuntimeError):
     """The state file exists but cannot be trusted. Do not upload."""
-
-
-def account_slug(account: str | None) -> str:
-    """Stable file key. Matches ``_account_env`` (case and separators folded)."""
-    slug = _SLUG.sub("_", str(account or "default")).strip("_.")
-    return (slug or "default").lower()
 
 
 def known_secrets(*values: object) -> list[str]:
@@ -51,58 +47,8 @@ def scrub(text: str, secrets: list[str]) -> str:
     return out
 
 
-class TikTokOAuthStore:
-    """``<working_directory>/oauth_state/tiktok_<account>.json``, mode 600."""
-
-    def __init__(self, root: Path | str) -> None:
-        self.root = Path(root)
-
-    def path_for(self, account: str | None) -> Path:
-        return self.root / f"tiktok_{account_slug(account)}.json"
-
-    def load(self, account: str | None) -> dict[str, Any] | None:
-        path = self.path_for(account)
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            # JSONDecodeError quotes a snippet of the file. Do not chain it:
-            # that snippet is the token.
-            raise TikTokOAuthStateError(
-                f"unreadable tiktok oauth state for account {account_slug(account)}"
-            ) from None
-        if not isinstance(data, dict):
-            raise TikTokOAuthStateError(
-                f"unreadable tiktok oauth state for account {account_slug(account)}"
-            )
-        return data
-
-    def save(self, account: str | None, payload: dict[str, Any]) -> Path:
-        """Atomic write (tmp + fsync + replace), then mode 600. Same idea as publish_state."""
-        self.root.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(self.root, 0o700)
-        except OSError:
-            pass
-        path = self.path_for(account)
-        fd, tmp = tempfile.mkstemp(dir=self.root, prefix=path.name, suffix=".tmp")
-        try:
-            os.chmod(tmp, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, ensure_ascii=False, indent=2)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, path)
-            os.chmod(path, 0o600)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        return path
+def _account(account: str | None) -> str:
+    return slug(str(account or ""), fallback="default")
 
 
 def _parse_dt(value: object) -> datetime | None:
@@ -145,6 +91,24 @@ def _json_object(response: httpx.Response) -> dict[str, Any]:
     return body if isinstance(body, dict) else {}
 
 
+def _load_cached(working_directory: Path, account: str) -> dict[str, Any] | None:
+    """Load the shared store. A present but unreadable file is fatal.
+
+    ``load_oauth_state`` turns a broken file into None so other platforms can
+    fall back to the env token. TikTok must not: the file may hold the rotated
+    refresh token, and the exception must not quote the file (it is the token).
+    """
+    path = oauth_state_path(working_directory, _PROVIDER, account)
+    if not path.is_file():
+        return None
+    cached = load_oauth_state(working_directory, _PROVIDER, account)
+    if cached is None:
+        raise TikTokOAuthStateError(
+            f"unreadable tiktok oauth state for account {_account(account)}"
+        ) from None
+    return cached
+
+
 def resolve_access_token(
     *,
     account: str,
@@ -152,23 +116,28 @@ def resolve_access_token(
     client_key: str,
     client_secret: str,
     refresh_token: str,
-    oauth_state_dir: Path | None,
+    working_directory: Path | None,
     client: httpx.Client,
     now: datetime | None = None,
-) -> tuple[str, list[str]]:
-    """Return a bearer token and every secret that must be scrubbed from errors.
+    force: bool = False,
+) -> tuple[str, list[str], bool, bool]:
+    """Return ``(access_token, secrets, refreshed, can_refresh)``.
 
-    A static ``TIKTOK_ACCESS_TOKEN`` with no known expiry is used as-is.
-    A cached token that expires in under 10 minutes is refreshed once.
-    The new access token, refresh token and expiries are written to
-    ``oauth_state`` and are never returned except as the bearer itself.
+    Refresh once when client key, secret and a refresh token are available and
+    any of these is true: there is no access token, the expiry is unknown
+    (a static ``TIKTOK_ACCESS_TOKEN`` with no saved file), the cached expiry
+    is inside 10 minutes, or the caller got a 401 (``force``).
+
+    An access token with no refresh material is used as-is. The new access
+    token, refresh token and expiries are written through ``oauth_state`` and
+    are never logged.
     """
     moment = now or datetime.now(timezone.utc)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
 
-    store = TikTokOAuthStore(oauth_state_dir) if oauth_state_dir is not None else None
-    cached = store.load(account) if store is not None else None
+    name = _account(account)
+    cached = _load_cached(working_directory, name) if working_directory is not None else None
     cached_access = str((cached or {}).get("access_token") or "").strip()
     cached_refresh = str((cached or {}).get("refresh_token") or "").strip()
     env_access = (access_token or "").strip()
@@ -181,14 +150,14 @@ def resolve_access_token(
     refresh = cached_refresh or env_refresh
     expires_at = _parse_dt((cached or {}).get("access_expires_at")) if cached_access else None
     can_refresh = bool(key and secret and refresh)
-    needs_refresh = (not access) or (
-        expires_at is not None and expires_at - moment < REFRESH_SKEW
-    )
+    unknown_expiry = expires_at is None
+    within_skew = expires_at is not None and expires_at - moment < REFRESH_SKEW
+    needs_refresh = (not access) or (can_refresh and (force or unknown_expiry or within_skew))
 
     secrets = known_secrets(access, env_access, cached_access, refresh, env_refresh, cached_refresh, secret, key)
 
     if needs_refresh and can_refresh:
-        if store is None:
+        if working_directory is None:
             raise RuntimeError("tiktok oauth state directory missing") from None
         fresh = _refresh(client, client_key=key, client_secret=secret, refresh_token=refresh)
         access_expires = moment + timedelta(seconds=int(fresh.get("expires_in") or 86400))
@@ -196,7 +165,7 @@ def resolve_access_token(
         new_refresh = str(fresh.get("refresh_token") or refresh).strip()
         new_access = str(fresh["access_token"]).strip()
         payload: dict[str, Any] = {
-            "account": account_slug(account),
+            "account": name,
             "access_token": new_access,
             "refresh_token": new_refresh,
             "access_expires_at": access_expires.isoformat(),
@@ -211,10 +180,10 @@ def resolve_access_token(
             payload["open_id"] = fresh["open_id"]
         if fresh.get("scope"):
             payload["scope"] = fresh["scope"]
-        store.save(account, payload)
-        logger.info("tiktok access token refreshed", account=account_slug(account))
+        save_oauth_state(working_directory, _PROVIDER, name, payload)
+        logger.info("tiktok access token refreshed", account=name)
         secrets = known_secrets(*secrets, new_access, new_refresh)
-        return new_access, secrets
+        return new_access, secrets, True, True
 
     if needs_refresh and not access:
         raise RuntimeError("TIKTOK_ACCESS_TOKEN missing") from None
@@ -225,7 +194,7 @@ def resolve_access_token(
         ) from None
     if not access:
         raise RuntimeError("TIKTOK_ACCESS_TOKEN missing") from None
-    return access, secrets
+    return access, secrets, False, can_refresh
 
 
 def _refresh(

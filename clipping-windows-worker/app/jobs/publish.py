@@ -151,7 +151,8 @@ class PublishJob(BaseJob):
                 client_key=_account_env(self.settings, "tiktok_client_key", account),
                 client_secret=_account_env(self.settings, "tiktok_client_secret", account),
                 refresh_token=_account_env(self.settings, "tiktok_refresh_token", account),
-                oauth_state_dir=Path(self.settings.working_directory) / "oauth_state",
+                working_directory=Path(self.settings.working_directory),
+                clip_id=str(clip_id),
             )
             post_url = uploaded["post_url"]
             extra = {
