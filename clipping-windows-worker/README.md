@@ -98,8 +98,13 @@ copy .env.example .env
 | `PUBLISH_STATE_DIR` | Registro local de publicaciones reales (idempotencia en reintentos) | `<WORKING_DIRECTORY>\publish_state` |
 | `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` / `YOUTUBE_REFRESH_TOKEN` | OAuth de YouTube | — |
 | `YOUTUBE_PRIVACY` | `private` / `unlisted` / `public` | `private` |
-| `INSTAGRAM_ACCESS_TOKEN` / `INSTAGRAM_IG_USER_ID` | Graph API (Reels) | — |
+| `INSTAGRAM_ACCESS_TOKEN` / `INSTAGRAM_IG_USER_ID` | Graph API (Reels). Otra cuenta: `INSTAGRAM_ACCESS_TOKEN_<KEY>` | — |
+| `INSTAGRAM_AUTH` | `facebook` (página vinculada, `graph.facebook.com`) o `instagram` (Instagram Login, `graph.instagram.com`) | `facebook` |
+| `INSTAGRAM_APP_ID` / `INSTAGRAM_APP_SECRET` | App de Meta. Hacen falta para refrescar el token en modo `facebook` | — |
+| `INSTAGRAM_GRAPH_VERSION` | Versión de Graph API en las URLs de publicación y de refresco `facebook` | `v21.0` |
 | `TIKTOK_ACCESS_TOKEN` / `TIKTOK_PRIVACY` | Content Posting API | — / `SELF_ONLY` |
+
+El token de larga duración dura unos 60 días. Antes de subir, si quedan menos de 7 días (o no hay fecha), el worker lo renueva y guarda token + caducidad en `<WORKING_DIRECTORY>/oauth_state/instagram_<cuenta>.json` (modo `0600`). No subas esa carpeta a git. A partir de ahí el fichero manda: si pegas un token nuevo en `.env`, borra el json de esa cuenta para que el worker lo coja. Si el refresco falla, la subida sigue con el token actual y queda un WARNING en el log (sin el token ni el secret).
 
 > **Seguridad:** nunca subas `.env` a Git. Usa `.env.example` como plantilla.
 
