@@ -29,7 +29,12 @@ def _account_env(settings, base_field: str, account_key: str) -> str:
     `account_key` 'default' (or a key without an override) reads the legacy
     single-account field, so old deployments work unchanged. Other keys read
     ``<BASE_FIELD>_<KEY>`` from the environment, e.g.
-    ``INSTAGRAM_ACCESS_TOKEN_IG2`` for account key ``ig2``."""
+    ``INSTAGRAM_ACCESS_TOKEN_IG2`` for account key ``ig2``.
+
+    YouTube does not use this helper. A non-default YouTube account must not
+    fall back field by field (that mixes one account's client with another's
+    refresh token). See ``_youtube_credentials``.
+    """
     key = _account_key(account_key)
     override = ""
     if key and key != "DEFAULT":
@@ -37,6 +42,41 @@ def _account_env(settings, base_field: str, account_key: str) -> str:
     if override:
         return override
     return (getattr(settings, base_field, None) or "").strip()
+
+
+_YOUTUBE_CREDENTIAL_FIELDS = (
+    "youtube_client_id",
+    "youtube_client_secret",
+    "youtube_refresh_token",
+)
+
+
+def _youtube_credentials(settings, account_key: str) -> dict[str, str]:
+    """Client id, secret and refresh token for one YouTube account.
+
+    ``default`` reads the legacy settings fields. Any other account requires
+    all three ``YOUTUBE_*_<KEY>`` variables. A missing suffix is an error:
+    fields are never filled from the default account, so a client id from one
+    account cannot be paired with a refresh token from another.
+    """
+    key = _account_key(account_key)
+    if not key or key == "DEFAULT":
+        return {
+            field: (getattr(settings, field, None) or "").strip()
+            for field in _YOUTUBE_CREDENTIAL_FIELDS
+        }
+    missing: list[str] = []
+    values: dict[str, str] = {}
+    for field in _YOUTUBE_CREDENTIAL_FIELDS:
+        name = f"{field.upper()}_{key}"
+        value = (os.environ.get(name) or "").strip()
+        values[field] = value
+        if not value:
+            missing.append(name)
+    if missing:
+        detail = ", ".join(f"{name} missing" for name in missing)
+        raise RuntimeError(f"youtube account {key} {detail}")
+    return values
 
 
 def _assert_past_scheduled_at(payload: dict) -> None:
@@ -106,13 +146,14 @@ class PublishJob(BaseJob):
             from app.services.youtube_upload import upload_short
 
             account = str(payload.get("account") or "default")
+            youtube_creds = _youtube_credentials(self.settings, account)
             uploaded = upload_short(
                 file_path=dest,
                 title=str(title),
                 description=str(caption),
-                client_id=_account_env(self.settings, "youtube_client_id", account),
-                client_secret=_account_env(self.settings, "youtube_client_secret", account),
-                refresh_token=_account_env(self.settings, "youtube_refresh_token", account),
+                client_id=youtube_creds["youtube_client_id"],
+                client_secret=youtube_creds["youtube_client_secret"],
+                refresh_token=youtube_creds["youtube_refresh_token"],
                 privacy=getattr(self.settings, "youtube_privacy", None) or "private",
                 paid_promotion=bool(payload.get("paid_promotion")),
             )

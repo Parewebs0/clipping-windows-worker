@@ -1,7 +1,9 @@
 """Read-only publish credential check. googleapiclient, google.oauth2 and httpx are mocked."""
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -33,6 +35,12 @@ def _load():
 @pytest.fixture(scope="module")
 def creds():
     return _load()
+
+
+@pytest.fixture(autouse=True)
+def _clear_instagram_endpoint_env(monkeypatch):
+    monkeypatch.delenv("INSTAGRAM_AUTH", raising=False)
+    monkeypatch.delenv("INSTAGRAM_GRAPH_VERSION", raising=False)
 
 
 def _settings(**overrides) -> Settings:
@@ -157,8 +165,25 @@ def test_hosts_match_uploaders(creds):
     import app.services.tiktok_upload as tt
     import app.services.youtube_upload as yt
 
-    assert creds.GRAPH == ig.GRAPH
-    assert creds.API_VERSION == ig.API_VERSION
+    # MOLI-77 (#26) renames GRAPH / API_VERSION to GRAPH_FACEBOOK /
+    # DEFAULT_GRAPH_VERSION. This file has to pass on both.
+    facebook = getattr(ig, "GRAPH_FACEBOOK", None)
+    if facebook is None:
+        facebook = ig.GRAPH
+    version = getattr(ig, "DEFAULT_GRAPH_VERSION", None)
+    if version is None:
+        version = ig.API_VERSION
+    assert creds.GRAPH_FACEBOOK == facebook
+    assert creds.DEFAULT_GRAPH_VERSION == version
+    instagram_login = getattr(ig, "GRAPH_INSTAGRAM", None)
+    if instagram_login is not None:
+        assert creds.GRAPH_INSTAGRAM == instagram_login
+    legacy_graph = getattr(ig, "GRAPH", None)
+    if legacy_graph is not None:
+        assert creds.GRAPH == legacy_graph
+    legacy_version = getattr(ig, "API_VERSION", None)
+    if legacy_version is not None:
+        assert creds.API_VERSION == legacy_version
     assert creds.TIKTOK_OPEN == tt.OPEN
     assert creds.TOKEN_URI == yt.TOKEN_URI
 
@@ -394,6 +419,159 @@ def test_exit_codes_and_secrets_absent_from_stdout(creds, monkeypatch, capsys):
     assert "tiktok default FAIL TIKTOK_ACCESS_TOKEN missing" in captured.out
     assert "youtube default OK" in captured.out
     _assert_no_secrets(captured.out + captured.err)
+
+
+def _write_oauth(tmp_path: Path, provider: str, account: str, payload: dict) -> Path:
+    path = tmp_path / "oauth_state" / f"{provider}_{account}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_instagram_auth_and_graph_version(creds, monkeypatch):
+    monkeypatch.setenv("INSTAGRAM_AUTH", "instagram")
+    monkeypatch.setenv("INSTAGRAM_GRAPH_VERSION", "v22.0")
+    url = f"{creds.GRAPH_INSTAGRAM}/v22.0/{IG_USER}"
+
+    def handler(method, url, kwargs):
+        assert kwargs["headers"]["Authorization"] == f"Bearer {IG_TOKEN}"
+        return _Response(200, {"username": "boxabl", "account_type": "BUSINESS"})
+
+    _install_http(monkeypatch, creds, {("GET", url): handler})
+    line = creds.check_instagram(_settings(), "default")
+    assert line == 'instagram default OK username="boxabl" account_type=BUSINESS'
+    _assert_no_secrets(line)
+
+
+def test_invalid_graph_version_stays_on_default(creds, monkeypatch):
+    monkeypatch.setenv("INSTAGRAM_GRAPH_VERSION", "latest")
+    url = f"{creds.GRAPH_FACEBOOK}/{creds.DEFAULT_GRAPH_VERSION}/{IG_USER}"
+
+    def handler(method, url, kwargs):
+        return _Response(200, {"username": "boxabl", "account_type": "BUSINESS"})
+
+    _install_http(monkeypatch, creds, {("GET", url): handler})
+    line = creds.check_instagram(_settings(), "default")
+    assert line.startswith("instagram default OK")
+
+
+def test_instagram_oauth_state_token_is_used_and_not_printed(creds, monkeypatch, tmp_path):
+    stored = "ig-stored-token-DO-NOT-PRINT-7f3a1c"
+    path = _write_oauth(
+        tmp_path,
+        "instagram",
+        "default",
+        {"access_token": stored, "seed": hashlib.sha256(IG_TOKEN.encode()).hexdigest()},
+    )
+    before = path.read_bytes()
+    url = f"{creds.GRAPH}/{creds.API_VERSION}/{IG_USER}"
+
+    def handler(method, url, kwargs):
+        assert kwargs["headers"]["Authorization"] == f"Bearer {stored}"
+        return _Response(200, {"username": "boxabl", "account_type": "CREATOR"})
+
+    _install_http(monkeypatch, creds, {("GET", url): handler})
+    settings = _settings(working_directory=str(tmp_path))
+    line = creds.check_instagram(settings, "default")
+    assert line == 'instagram default OK username="boxabl" account_type=CREATOR'
+    assert stored not in line
+    assert IG_TOKEN not in line
+    assert path.read_bytes() == before
+
+
+def test_instagram_oauth_state_covers_missing_env_token(creds, monkeypatch, tmp_path):
+    stored = "ig-stored-token-DO-NOT-PRINT-7f3a1c"
+    _write_oauth(tmp_path, "instagram", "ig2", {"access_token": stored})
+    monkeypatch.delenv("INSTAGRAM_ACCESS_TOKEN_IG2", raising=False)
+    monkeypatch.setenv("INSTAGRAM_IG_USER_ID_IG2", IG_USER)
+    url = f"{creds.GRAPH}/{creds.API_VERSION}/{IG_USER}"
+
+    def handler(method, url, kwargs):
+        assert kwargs["headers"]["Authorization"] == f"Bearer {stored}"
+        return _Response(200, {"username": "boxabl", "account_type": "BUSINESS"})
+
+    _install_http(monkeypatch, creds, {("GET", url): handler})
+    settings = _settings(working_directory=str(tmp_path), instagram_access_token="")
+    line = creds.check_instagram(settings, "ig2")
+    assert line.startswith("instagram ig2 OK")
+    assert stored not in line
+    assert IG_TOKEN not in line
+
+
+def test_instagram_oauth_state_still_requires_ig_user_id(creds, monkeypatch, tmp_path):
+    stored = "ig-stored-token-DO-NOT-PRINT-7f3a1c"
+    _write_oauth(tmp_path, "instagram", "default", {"access_token": stored})
+
+    def boom(*args, **kwargs):
+        raise AssertionError("network")
+
+    monkeypatch.setattr(creds.httpx, "Client", boom)
+    settings = _settings(
+        working_directory=str(tmp_path),
+        instagram_access_token="",
+        instagram_ig_user_id="",
+    )
+    line = creds.check_instagram(settings, "default")
+    assert line == "instagram default FAIL INSTAGRAM_IG_USER_ID missing"
+    assert stored not in line
+
+
+def test_instagram_seed_mismatch_keeps_env_token(creds, monkeypatch, tmp_path):
+    stored = "ig-stored-token-DO-NOT-PRINT-7f3a1c"
+    _write_oauth(tmp_path, "instagram", "default", {"access_token": stored, "seed": "0" * 64})
+    url = f"{creds.GRAPH}/{creds.API_VERSION}/{IG_USER}"
+
+    def handler(method, url, kwargs):
+        assert kwargs["headers"]["Authorization"] == f"Bearer {IG_TOKEN}"
+        return _Response(200, {"username": "boxabl", "account_type": "BUSINESS"})
+
+    _install_http(monkeypatch, creds, {("GET", url): handler})
+    line = creds.check_instagram(_settings(working_directory=str(tmp_path)), "default")
+    assert line.startswith("instagram default OK")
+    assert stored not in line
+
+
+def test_corrupt_oauth_state_falls_back_to_env_token(creds, monkeypatch, tmp_path):
+    path = tmp_path / "oauth_state" / "instagram_default.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{not-json " + IG_TOKEN, encoding="utf-8")
+    url = f"{creds.GRAPH}/{creds.API_VERSION}/{IG_USER}"
+
+    def handler(method, url, kwargs):
+        assert kwargs["headers"]["Authorization"] == f"Bearer {IG_TOKEN}"
+        return _Response(200, {"username": "boxabl", "account_type": "BUSINESS"})
+
+    _install_http(monkeypatch, creds, {("GET", url): handler})
+    line = creds.check_instagram(_settings(working_directory=str(tmp_path)), "default")
+    assert line.startswith("instagram default OK")
+    assert IG_TOKEN not in line
+    assert "not-json" not in line
+
+
+def test_tiktok_oauth_state_token_is_used_and_not_printed(creds, monkeypatch, tmp_path):
+    stored = "tt-stored-token-DO-NOT-PRINT-7f3a1c"
+    path = _write_oauth(tmp_path, "tiktok", "default", {"access_token": stored})
+    before = path.read_bytes()
+    url = f"{creds.TIKTOK_OPEN}/v2/post/publish/creator_info/query/"
+
+    def handler(method, url, kwargs):
+        assert kwargs["headers"]["Authorization"] == f"Bearer {stored}"
+        assert kwargs["content"] == b"{}"
+        return _Response(
+            200,
+            {
+                "data": {"creator_username": "boxabl", "privacy_level_options": ["SELF_ONLY"]},
+                "error": {"code": "ok"},
+            },
+        )
+
+    _install_http(monkeypatch, creds, {("POST", url): handler})
+    settings = _settings(working_directory=str(tmp_path), tiktok_access_token="")
+    line = creds.check_tiktok(settings, "default")
+    assert line == 'tiktok default OK username="boxabl" privacy_level_options=SELF_ONLY'
+    assert stored not in line
+    assert TT_TOKEN not in line
+    assert path.read_bytes() == before
 
 
 def test_yt2_check_reads_suffixed_env(creds, monkeypatch):
