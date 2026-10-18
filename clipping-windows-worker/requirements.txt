@@ -2,6 +2,8 @@
 pydantic>=2.7.0
 pydantic-settings>=2.3.0
 httpx>=0.27.0
+# captions_visible reads one gray frame. enhance.py imports numpy too.
+numpy>=1.26.0
 
 # Logging estructurado (opcional pero recomendado)
 structlog>=24.1.0
