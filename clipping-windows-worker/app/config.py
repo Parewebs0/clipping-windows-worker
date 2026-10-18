@@ -1,6 +1,7 @@
 """Configuración central del Worker mediante pydantic-settings."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -81,6 +82,11 @@ class Settings(BaseSettings):
     youtube_privacy: str = "private"
     instagram_access_token: str | None = None
     instagram_ig_user_id: str | None = None
+    # facebook: linked Page on graph.facebook.com (default). instagram: Instagram Login.
+    instagram_auth: str = "facebook"
+    instagram_app_id: str | None = None
+    instagram_app_secret: str | None = None
+    instagram_graph_version: str = "v21.0"
     tiktok_access_token: str | None = None
     tiktok_privacy: str = "SELF_ONLY"
     # Where successful live publications are recorded (idempotency on retries).
@@ -124,6 +130,37 @@ class Settings(BaseSettings):
             if v not in {"private", "unlisted", "public"}:
                 raise ValueError("YOUTUBE_PRIVACY must be private, unlisted or public")
             return v
+        return value
+
+    @field_validator("instagram_auth", mode="before")
+    @classmethod
+    def _normalize_instagram_auth(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return "facebook"
+        if isinstance(value, str):
+            mode = value.strip().lower()
+            if mode not in {"facebook", "instagram"}:
+                raise ValueError("INSTAGRAM_AUTH must be facebook or instagram")
+            return mode
+        return value
+
+    @field_validator("instagram_app_id", "instagram_app_secret", mode="before")
+    @classmethod
+    def _empty_instagram_app_is_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("instagram_graph_version", mode="before")
+    @classmethod
+    def _normalize_instagram_graph_version(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return "v21.0"
+        if isinstance(value, str):
+            version = value.strip()
+            if not re.fullmatch(r"v\d+(?:\.\d+)?", version):
+                raise ValueError("INSTAGRAM_GRAPH_VERSION must look like v21.0")
+            return version
         return value
 
     @field_validator("publish_state_dir", mode="before")

@@ -121,6 +121,12 @@ class PublishJob(BaseJob):
                 caption=str(caption),
                 access_token=_account_env(self.settings, "instagram_access_token", account),
                 ig_user_id=_account_env(self.settings, "instagram_ig_user_id", account),
+                account_key=account,
+                working_directory=self.settings.working_directory,
+                auth=getattr(self.settings, "instagram_auth", None),
+                app_id=getattr(self.settings, "instagram_app_id", None),
+                app_secret=getattr(self.settings, "instagram_app_secret", None),
+                graph_version=getattr(self.settings, "instagram_graph_version", None),
             )
             post_url = uploaded["post_url"]
             extra = {"media_id": uploaded.get("media_id"), "account": account}

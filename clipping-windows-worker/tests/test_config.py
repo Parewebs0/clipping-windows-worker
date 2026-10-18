@@ -65,6 +65,43 @@ def test_youtube_privacy_rejects_invalid(tmp_path: Path, monkeypatch) -> None:
         Settings(working_directory=str(tmp_path))
 
 
+def test_instagram_auth_and_graph_version_defaults(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("INSTAGRAM_AUTH", raising=False)
+    monkeypatch.delenv("INSTAGRAM_GRAPH_VERSION", raising=False)
+    monkeypatch.delenv("INSTAGRAM_APP_ID", raising=False)
+    monkeypatch.delenv("INSTAGRAM_APP_SECRET", raising=False)
+    settings = Settings(working_directory=str(tmp_path))
+    assert settings.instagram_auth == "facebook"
+    assert settings.instagram_graph_version == "v21.0"
+    assert settings.instagram_app_id is None
+    assert settings.instagram_app_secret is None
+
+
+def test_instagram_auth_and_graph_version_from_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("INSTAGRAM_AUTH", " Instagram ")
+    monkeypatch.setenv("INSTAGRAM_GRAPH_VERSION", " v22.0 ")
+    monkeypatch.setenv("INSTAGRAM_APP_ID", "")
+    monkeypatch.setenv("INSTAGRAM_APP_SECRET", "")
+    settings = Settings(working_directory=str(tmp_path))
+    assert settings.instagram_auth == "instagram"
+    assert settings.instagram_graph_version == "v22.0"
+    assert settings.instagram_app_id is None
+    assert settings.instagram_app_secret is None
+
+
+def test_instagram_auth_and_graph_version_reject_invalid(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    monkeypatch.setenv("INSTAGRAM_AUTH", "meta")
+    with pytest.raises(ValidationError):
+        Settings(working_directory=str(tmp_path))
+    monkeypatch.setenv("INSTAGRAM_AUTH", "facebook")
+    monkeypatch.setenv("INSTAGRAM_GRAPH_VERSION", "21.0")
+    with pytest.raises(ValidationError):
+        Settings(working_directory=str(tmp_path))
+
+
 def test_empty_publish_state_dir_means_default(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("PUBLISH_STATE_DIR", "")
     assert Settings(working_directory=str(tmp_path)).publish_state_dir is None
