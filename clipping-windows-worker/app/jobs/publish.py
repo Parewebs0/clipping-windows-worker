@@ -168,6 +168,12 @@ class PublishJob(BaseJob):
                 caption=str(caption),
                 access_token=_account_env(self.settings, "instagram_access_token", account),
                 ig_user_id=_account_env(self.settings, "instagram_ig_user_id", account),
+                account_key=account,
+                working_directory=self.settings.working_directory,
+                auth=getattr(self.settings, "instagram_auth", None),
+                app_id=getattr(self.settings, "instagram_app_id", None),
+                app_secret=getattr(self.settings, "instagram_app_secret", None),
+                graph_version=getattr(self.settings, "instagram_graph_version", None),
             )
             post_url = uploaded["post_url"]
             extra = {"media_id": uploaded.get("media_id"), "account": account}
@@ -179,11 +185,21 @@ class PublishJob(BaseJob):
             # (caption already carries mentions/FTC/hashtags, ≤2200). The old
             # title-only path dropped the hashtags entirely.
             tiktok_text = str(caption).strip() or str(title)
+            handle_raw = payload.get("handle")
             uploaded = upload_video(
                 file_path=dest,
                 title=tiktok_text,
                 access_token=_account_env(self.settings, "tiktok_access_token", account),
                 privacy_level=getattr(self.settings, "tiktok_privacy", None) or "SELF_ONLY",
+                mode=getattr(self.settings, "tiktok_mode", None) or "inbox",
+                paid_promotion=bool(payload.get("paid_promotion")),
+                handle=str(handle_raw).strip() if handle_raw else None,
+                account=account,
+                client_key=_account_env(self.settings, "tiktok_client_key", account),
+                client_secret=_account_env(self.settings, "tiktok_client_secret", account),
+                refresh_token=_account_env(self.settings, "tiktok_refresh_token", account),
+                working_directory=Path(self.settings.working_directory),
+                clip_id=str(clip_id),
             )
             post_url = uploaded["post_url"]
             extra = {
@@ -191,6 +207,10 @@ class PublishJob(BaseJob):
                 "privacy_level": uploaded.get("privacy_level"),
                 "account": account,
             }
+            if uploaded.get("post_id"):
+                extra["post_id"] = uploaded["post_id"]
+            if uploaded.get("publicaly_available_post_id"):
+                extra["publicaly_available_post_id"] = uploaded["publicaly_available_post_id"]
 
         pub = {"platform": platform, "status": "posted", "post_url": post_url}
         pub.update(extra)
