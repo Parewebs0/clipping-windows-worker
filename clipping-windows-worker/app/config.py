@@ -88,6 +88,11 @@ class Settings(BaseSettings):
     instagram_app_secret: str | None = None
     instagram_graph_version: str = "v21.0"
     tiktok_access_token: str | None = None
+    tiktok_client_key: str | None = None
+    tiktok_client_secret: str | None = None
+    tiktok_refresh_token: str | None = None
+    # inbox: draft in the TikTok app (video.upload). direct: auto-post (video.publish).
+    tiktok_mode: str = "inbox"
     tiktok_privacy: str = "SELF_ONLY"
     # Where successful live publications are recorded (idempotency on retries).
     # Default: <working_directory>/publish_state. Must survive restarts.
@@ -161,6 +166,18 @@ class Settings(BaseSettings):
             if not re.fullmatch(r"v\d+(?:\.\d+)?", version):
                 raise ValueError("INSTAGRAM_GRAPH_VERSION must look like v21.0")
             return version
+        return value
+
+    @field_validator("tiktok_mode", mode="before")
+    @classmethod
+    def _normalize_tiktok_mode(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return "inbox"
+        if isinstance(value, str):
+            mode = value.strip().lower()
+            if mode not in {"inbox", "direct"}:
+                raise ValueError("TIKTOK_MODE must be inbox or direct")
+            return mode
         return value
 
     @field_validator("publish_state_dir", mode="before")

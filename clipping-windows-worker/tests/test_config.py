@@ -102,6 +102,26 @@ def test_instagram_auth_and_graph_version_reject_invalid(tmp_path: Path, monkeyp
         Settings(working_directory=str(tmp_path))
 
 
+def test_tiktok_mode_defaults_to_inbox(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("TIKTOK_MODE", raising=False)
+    settings = Settings(working_directory=str(tmp_path))
+    assert settings.tiktok_mode == "inbox"
+    assert settings.tiktok_privacy == "SELF_ONLY"
+
+
+def test_tiktok_mode_normalises_and_rejects_unknown(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    monkeypatch.setenv("TIKTOK_MODE", " Direct ")
+    assert Settings(working_directory=str(tmp_path)).tiktok_mode == "direct"
+    monkeypatch.setenv("TIKTOK_MODE", "")
+    assert Settings(working_directory=str(tmp_path)).tiktok_mode == "inbox"
+    monkeypatch.setenv("TIKTOK_MODE", "story")
+    with pytest.raises(ValidationError):
+        Settings(working_directory=str(tmp_path))
+
+
 def test_empty_publish_state_dir_means_default(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("PUBLISH_STATE_DIR", "")
     assert Settings(working_directory=str(tmp_path)).publish_state_dir is None

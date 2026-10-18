@@ -102,7 +102,10 @@ copy .env.example .env
 | `INSTAGRAM_AUTH` | `facebook` (página vinculada, `graph.facebook.com`) o `instagram` (Instagram Login, `graph.instagram.com`) | `facebook` |
 | `INSTAGRAM_APP_ID` / `INSTAGRAM_APP_SECRET` | App de Meta. Hacen falta para refrescar el token en modo `facebook` | — |
 | `INSTAGRAM_GRAPH_VERSION` | Versión de Graph API en las URLs de publicación y de refresco `facebook` | `v21.0` |
-| `TIKTOK_ACCESS_TOKEN` / `TIKTOK_PRIVACY` | Content Posting API | — / `SELF_ONLY` |
+| `TIKTOK_MODE` | `inbox` (borrador en la app) o `direct` (publica solo, scope `video.publish`). Si el sondeo se agota con el vídeo ya subido, el `publish_id` queda en `<WORKING_DIRECTORY>/tiktok_pending/` y el reintento solo consulta ese id | `inbox` |
+| `TIKTOK_ACCESS_TOKEN` | Access token. Si hay client key, secret y refresh, se refresca cuando la caducidad es desconocida, queda menos de 10 min, o TikTok responde 401. El nuevo queda en `<WORKING_DIRECTORY>/oauth_state/` (no en `.env`). Sin material de refresco se usa tal cual | — |
+| `TIKTOK_CLIENT_KEY` / `TIKTOK_CLIENT_SECRET` / `TIKTOK_REFRESH_TOKEN` | OAuth para refrescar el access token. Por cuenta: sufijo `_<ACCOUNT>`. TikTok rota el refresh: el mini PC y el worker de Windows no pueden compartir el mismo token; credenciales distintas por worker | — |
+| `TIKTOK_PRIVACY` | `SELF_ONLY` / `MUTUAL_FOLLOW_FRIENDS` / `FOLLOWER_OF_CREATOR` / `PUBLIC_TO_EVERYONE`. En `direct` tiene que estar en `privacy_level_options`. Una campaña de pago (`brand_content_toggle`) no puede ir con `SELF_ONLY` | `SELF_ONLY` |
 
 El token de larga duración dura unos 60 días. Antes de subir, si quedan menos de 7 días (o no hay fecha), el worker lo renueva y guarda token + caducidad en `<WORKING_DIRECTORY>/oauth_state/instagram_<cuenta>.json` (modo `0600`). No subas esa carpeta a git. Si cambias el token en `.env`, ese json deja de usarse. En modo `facebook` hacen falta `INSTAGRAM_APP_ID` y `INSTAGRAM_APP_SECRET`; si faltan, no se intenta el refresco y el aviso sale una sola vez. Si el refresco falla por otro motivo, la subida sigue con el token actual y queda un WARNING en el log (sin el token ni el secret).
 
