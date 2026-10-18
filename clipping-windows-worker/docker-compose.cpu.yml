@@ -32,8 +32,7 @@ services:
       STORAGE_CLEANUP_DRY_RUN: ${STORAGE_CLEANUP_DRY_RUN:-true}
       DISK_HIGH_WATERMARK_PCT: "80"
       GOG_PATH: /usr/local/bin/gog
-      # Publishing stays off: no platform tokens are passed in.
-      YOUTUBE_REFRESH_TOKEN: ""
+      # YouTube creds come from .env.cpu; IG/TikTok stay off here.
       INSTAGRAM_ACCESS_TOKEN: ""
       TIKTOK_ACCESS_TOKEN: ""
       OMP_NUM_THREADS: "4"
