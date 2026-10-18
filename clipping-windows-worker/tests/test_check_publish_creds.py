@@ -444,6 +444,9 @@ def test_instagram_auth_and_graph_version(creds, monkeypatch):
 
 
 def test_invalid_graph_version_stays_on_default(creds, monkeypatch):
+    # Settings rejects a malformed INSTAGRAM_GRAPH_VERSION since MOLI-77 (#26),
+    # so build it first; the script must still ignore a bad raw env value.
+    settings = _settings()
     monkeypatch.setenv("INSTAGRAM_GRAPH_VERSION", "latest")
     url = f"{creds.GRAPH_FACEBOOK}/{creds.DEFAULT_GRAPH_VERSION}/{IG_USER}"
 
@@ -451,7 +454,7 @@ def test_invalid_graph_version_stays_on_default(creds, monkeypatch):
         return _Response(200, {"username": "boxabl", "account_type": "BUSINESS"})
 
     _install_http(monkeypatch, creds, {("GET", url): handler})
-    line = creds.check_instagram(_settings(), "default")
+    line = creds.check_instagram(settings, "default")
     assert line.startswith("instagram default OK")
 
 
