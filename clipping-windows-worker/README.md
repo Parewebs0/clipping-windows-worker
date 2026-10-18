@@ -111,6 +111,29 @@ El token de larga duración dura unos 60 días. Antes de subir, si quedan menos 
 
 > **Seguridad:** nunca subas `.env` a Git. Usa `.env.example` como plantilla.
 
+Otras cuentas usan el mismo nombre de variable más `_` y la clave en mayúsculas, leída del entorno del proceso. YouTube, si la cuenta no es `default`, exige las tres: `YOUTUBE_CLIENT_ID_YT2`, `YOUTUBE_CLIENT_SECRET_YT2` y `YOUTUBE_REFRESH_TOKEN_YT2`. Si falta una, el job falla y no rellena con las de `default`, así que no mezcla el client de una cuenta con el refresh token de otra. Instagram y TikTok, si no hay sufijo, siguen usando la credencial `default` campo a campo: `INSTAGRAM_ACCESS_TOKEN_IG2`, `INSTAGRAM_IG_USER_ID_IG2`, `TIKTOK_ACCESS_TOKEN_STUDIO`.
+
+El job publica exactamente `payload.account` (o `default` si el payload no trae cuenta). No recorre cuentas, no elige la primera que esté sana por orden alfabético y no asocia una cuenta a la campaña: eso lo decide quien crea el job. En YouTube, `channels.list` devuelve los canales de ese token y el chequeo enseña el primero (`items[0]`). Eso no elige canal por campaña.
+
+## Comprobar credenciales (sin publicar)
+
+`scripts/check_publish_creds.py` hace una llamada de solo lectura por plataforma. No sube ni publica nada, y no imprime tokens: si falta una variable, el motivo es el nombre (`YOUTUBE_REFRESH_TOKEN missing`).
+
+```bash
+python scripts/check_publish_creds.py
+python scripts/check_publish_creds.py --platform youtube --account default
+python scripts/check_publish_creds.py --platform instagram --account ig2
+python scripts/check_publish_creds.py --platform tiktok --account studio
+```
+
+`--platform` es `all` (por defecto), `youtube`, `instagram` o `tiktok`. `--account` es `default` si no se indica. Cada línea es `plataforma cuenta OK|FAIL motivo`. El proceso sale con 0 si todas están OK y con 1 si alguna falla.
+
+`default` usa `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` / `YOUTUBE_REFRESH_TOKEN` (y los equivalentes de Instagram y TikTok). Otra cuenta lee solo las variables con sufijo. En YouTube el job hace lo mismo: sin las tres variables con sufijo, falla y no llama a la API. Si falta `YOUTUBE_REFRESH_TOKEN_YT2`, el script también falla sin red. Instagram y TikTok en el job sí caen a `default` cuando no hay sufijo; el script no, para no dar un OK de la cuenta equivocada.
+
+`--account` comprueba una sola cuenta, la que pases. No busca la primera cuenta sana.
+
+YouTube refresca el token (sin pedir scopes de más) y llama a `channels.list(part=snippet, mine=true)`. Imprime el título del primer canal que devuelve el token, si incluye `youtube.upload` y, si está, `yt-analytics.readonly`. Instagram hace `GET /{ig-user-id}?fields=username,account_type` y exige `BUSINESS`, `CREATOR` o `MEDIA_CREATOR`. El host es `graph.facebook.com` salvo `INSTAGRAM_AUTH=instagram` (`graph.instagram.com`). La versión es `INSTAGRAM_GRAPH_VERSION` si tiene forma `v21.0` (si no, `v21.0`). Si existe `<WORKING_DIRECTORY>/oauth_state/instagram_<cuenta>.json` con `access_token`, el chequeo usa ese token (salvo que `seed` indique que el token de entorno cambió) y no refresca ni escribe el fichero. TikTok hace `POST /v2/post/publish/creator_info/query/` e imprime el username y `privacy_level_options`. Con `oauth_state/tiktok_<cuenta>.json`, usa el `access_token` guardado antes que `TIKTOK_ACCESS_TOKEN`. El script no imprime esos tokens.
+
 ---
 
 ## Ejecución
