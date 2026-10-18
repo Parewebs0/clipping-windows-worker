@@ -8,9 +8,13 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+# Scopes requested on refresh. They must be a subset of what the refresh token
+# was granted (youtube.upload + youtube.readonly + yt-analytics.readonly).
+# Requesting the full "youtube" scope, which is not granted, makes Google answer
+# invalid_scope and every publish job fails.
 SCOPES = (
     "https://www.googleapis.com/auth/youtube.upload",
-    "https://www.googleapis.com/auth/youtube",
+    "https://www.googleapis.com/auth/youtube.readonly",
 )
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
