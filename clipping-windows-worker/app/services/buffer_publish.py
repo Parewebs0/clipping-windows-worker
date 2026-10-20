@@ -85,8 +85,10 @@ def _post_input(
     return data
 
 
-def _pending_path(state_dir: Path, clip_id: str, platform: str) -> Path:
-    return Path(state_dir) / f"{clip_id}__{platform}.buffer.json"
+def _pending_path(state_dir: Path, clip_id: str, platform: str, account: str | None = None) -> Path:
+    from app.services.publish_state import account_suffix
+
+    return Path(state_dir) / f"{clip_id}__{platform}{account_suffix(account)}.buffer.json"
 
 
 def publish_video(
@@ -100,6 +102,7 @@ def publish_video(
     public_base_url: str,
     state_dir: Path,
     clip_id: str,
+    account: str | None = None,
     title: str = "",
     youtube_privacy: str = "public",
     youtube_category_id: str = "22",
@@ -124,7 +127,7 @@ def publish_video(
     if missing:
         raise BufferPublishError("buffer publish not configured: " + ", ".join(missing) + " missing")
 
-    pending = _pending_path(state_dir, clip_id, platform)
+    pending = _pending_path(state_dir, clip_id, platform, account)
     own_client = client is None
     http = client or httpx.Client(timeout=30.0)
     try:

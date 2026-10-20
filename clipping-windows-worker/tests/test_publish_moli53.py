@@ -262,7 +262,7 @@ def test_account_recorded_in_publication_state(tmp_path, fake_uploaders):
         _settings(tmp_path),
         _job(platform="instagram", payload_extra={"account": "ig2", "scheduled_at": PAST}),
     ).execute()
-    state = tmp_path / "data" / "publish_state" / f"{CLIP_ID}__instagram.json"
+    state = tmp_path / "data" / "publish_state" / f"{CLIP_ID}__instagram__ig2.json"
     data = json.loads(state.read_text(encoding="utf-8"))
     assert data["publication"]["account"] == "ig2"
     assert fake_uploaders["instagram"].call_args.kwargs["access_token"] == "tok-default"

@@ -10,9 +10,12 @@ Right after a successful upload the worker writes one small JSON file per
 publish job checks that file and, if present, reuses the stored publication
 (post_url, ids) instead of uploading again.
 
-The key is ``clip_id + platform`` (not ``job_id``) on purpose: it also covers a
-new publish job created later for the same clip/platform. To force a
-re-publish on purpose, delete the corresponding file.
+The key is ``clip_id + platform + account`` (not ``job_id``) on purpose: it
+also covers a new publish job created later for the same clip/platform/account.
+The ``default`` account keeps the legacy ``<clip>__<platform>.json`` name; a
+named account (``<clip>__<platform>__<account>.json``) is a different post, so a
+clip already on the shared account can be published on a dedicated one. To
+force a re-publish on purpose, delete the corresponding file.
 """
 from __future__ import annotations
 
@@ -27,6 +30,12 @@ from typing import Any
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
+def account_suffix(account: str | None) -> str:
+    """'' for the default account (legacy file names), else '__<account>'."""
+    key = _SAFE.sub("_", str(account or "").strip().lower())
+    return "" if key in ("", "default") else f"__{key}"
+
+
 class PublishStateError(RuntimeError):
     """The state file exists but cannot be read; refuse to guess."""
 
@@ -35,18 +44,18 @@ class PublishStateStore:
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
 
-    def path_for(self, clip_id: str, platform: str) -> Path:
+    def path_for(self, clip_id: str, platform: str, account: str | None = None) -> Path:
         clip = _SAFE.sub("_", str(clip_id)) or "unknown"
         plat = _SAFE.sub("_", str(platform).lower()) or "unknown"
-        return self.root / f"{clip}__{plat}.json"
+        return self.root / f"{clip}__{plat}{account_suffix(account)}.json"
 
-    def get(self, clip_id: str, platform: str) -> dict[str, Any] | None:
+    def get(self, clip_id: str, platform: str, account: str | None = None) -> dict[str, Any] | None:
         """Return the stored record or None if this clip/platform was never published.
 
         A present-but-unreadable file raises ``PublishStateError``: it means a
         publication probably happened, so we must not silently upload again.
         """
-        path = self.path_for(clip_id, platform)
+        path = self.path_for(clip_id, platform, account)
         if not path.exists():
             return None
         try:
@@ -65,13 +74,15 @@ class PublishStateStore:
         *,
         job_id: str | None = None,
         final_path_worker: str | None = None,
+        account: str | None = None,
     ) -> Path:
         """Atomically persist a successful publication (write tmp + fsync + replace)."""
         self.root.mkdir(parents=True, exist_ok=True)
-        path = self.path_for(clip_id, platform)
+        path = self.path_for(clip_id, platform, account)
         data = {
             "clip_id": str(clip_id),
             "platform": str(platform).lower(),
+            "account": str(account or "default"),
             "job_id": job_id,
             "final_path_worker": final_path_worker,
             "published_at": datetime.now(timezone.utc).isoformat(),

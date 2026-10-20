@@ -209,3 +209,33 @@ def test_store_path_is_sanitised(tmp_path):
     p = store.path_for("../evil", "YouTube")
     assert p.parent == tmp_path
     assert p.name == ".._evil__youtube.json"
+
+
+def test_state_is_per_account(tmp_path, fake_uploaders):
+    """A clip already on the shared account can be posted on a dedicated one, once."""
+    settings = _settings(tmp_path)
+    _pending_clip(tmp_path)
+    PublishJob(settings, _job("instagram", job_id="shared")).execute()
+    dedicated = _job("instagram", job_id="pbi-1")
+    dedicated.payload["account"] = "pbinvesting"
+    out = PublishJob(settings, dedicated).execute()
+    assert fake_uploaders["instagram"].call_count == 2
+    assert "reused_from_state" not in out["publications"][0]
+    retry = _job("instagram", job_id="pbi-2")
+    retry.payload["account"] = "pbinvesting"
+    assert PublishJob(settings, retry).execute()["publications"][0]["reused_from_state"] is True
+    assert fake_uploaders["instagram"].call_count == 2
+    state = tmp_path / "data" / "publish_state"
+    assert (state / f"{CLIP_ID}__instagram.json").exists()
+    assert json.loads((state / f"{CLIP_ID}__instagram__pbinvesting.json").read_text())["account"] == "pbinvesting"
+
+
+def test_account_suffix_default_keeps_legacy_names(tmp_path):
+    from app.services.buffer_publish import _pending_path
+
+    store = PublishStateStore(tmp_path)
+    assert store.path_for("c", "youtube").name == "c__youtube.json"
+    assert store.path_for("c", "youtube", "default").name == "c__youtube.json"
+    assert store.path_for("c", "youtube", "PBInvesting").name == "c__youtube__pbinvesting.json"
+    assert _pending_path(tmp_path, "c", "tiktok").name == "c__tiktok.buffer.json"
+    assert _pending_path(tmp_path, "c", "tiktok", "pbinvesting").name == "c__tiktok__pbinvesting.buffer.json"
