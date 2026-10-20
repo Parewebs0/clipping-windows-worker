@@ -1,8 +1,14 @@
 .git
 .env
+.env*
+!.env.example
 .venv
 venv
 data
+data-cpu/
+models-cpu/
+models/
+backups*/
 **/__pycache__
 *.mp4
 *.wav

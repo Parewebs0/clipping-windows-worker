@@ -131,12 +131,13 @@ class PublishJob(BaseJob):
         if platform not in {"youtube", "instagram", "tiktok"}:
             raise NotImplementedError(f"platform {platform} not implemented")
 
+        account = str(payload.get("account") or "default")
         if not dry_run:
             _assert_past_scheduled_at(payload)
             # Idempotency: a previous attempt may have published already and then
             # failed (e.g. reporting the result). Never upload the same clip twice.
             store = PublishStateStore(self._publish_state_dir())
-            prior = store.get(str(clip_id), platform)
+            prior = store.get(str(clip_id), platform, account)
             if prior is not None:
                 return self._reuse_prior(prior, clip_id=str(clip_id), campaign_id=campaign_id, file_path=file_path)
 
@@ -153,7 +154,6 @@ class PublishJob(BaseJob):
             }
 
         extra: dict[str, Any] = {}
-        account = str(payload.get("account") or "default")
         # Buffer key per account or org (BUFFER_API_KEY_<KEY>, else the global key) and channel
         # per account (BUFFER_CHANNEL_<PLATFORM>_<KEY>): a named account never posts on the default channel.
         buffer_key = _account_env(self.settings, "buffer_api_key", account)
@@ -194,6 +194,7 @@ class PublishJob(BaseJob):
                 public_base_url=self.settings.buffer_public_base_url or "",
                 state_dir=self._publish_state_dir(),
                 clip_id=str(clip_id),
+                account=account,
                 timeout_s=self.settings.buffer_publish_timeout,
             )
             post_url = uploaded["post_url"]
@@ -253,7 +254,8 @@ class PublishJob(BaseJob):
         pub.update(extra)
         # Persist BEFORE anything else can fail (reporting to the API happens later).
         try:
-            store.record(str(clip_id), platform, pub, job_id=str(self.job.id), final_path_worker=str(dest))
+            store.record(str(clip_id), platform, pub, job_id=str(self.job.id), final_path_worker=str(dest),
+                         account=account)
         except Exception as e:  # noqa: BLE001
             # Do not fail the job here: failing would trigger a retry that
             # re-publishes. The API result is then the only record.
