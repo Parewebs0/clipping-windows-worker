@@ -221,3 +221,54 @@ def test_publish_job_without_key_keeps_direct_uploader(tmp_path, monkeypatch):
 
 def test_empty_public_dir_is_none(tmp_path):
     assert _settings(tmp_path, buffer_public_dir="").buffer_public_dir is None
+
+
+# --- YouTube Shorts through Buffer for accounts without OAuth ------------------
+
+def test_youtube_post_input_has_shorts_metadata():
+    data = buffer_publish._post_input("youtube", "CH-YT", "copy #PBInvesting", "https://x/v.mp4",
+                                      title="A" * 120, youtube_privacy="public", youtube_category_id="27")
+    assert data["metadata"] == {"youtube": {"title": "A" * 100, "categoryId": "27", "privacy": "public",
+                                            "madeForKids": False, "isAiGenerated": False}}
+    assert buffer_publish._post_input("youtube", "c", "t", "u", youtube_privacy="weird")["metadata"]["youtube"]["privacy"] == "private"
+
+
+def _yt_settings(tmp_path, **kw):
+    return _settings(tmp_path, buffer_api_key="k-global", buffer_public_dir=str(tmp_path / "pub"),
+                     buffer_public_base_url=BASE, youtube_privacy="public", **kw)
+
+
+def test_dedicated_youtube_without_oauth_goes_through_buffer(tmp_path, monkeypatch):
+    _pending(tmp_path)
+    calls = []
+    monkeypatch.setattr(buffer_publish, "publish_video",
+                        lambda **kw: calls.append(kw) or {"post_url": "https://youtube.com/shorts/x", "buffer_post_id": "P1"})
+    monkeypatch.setenv("BUFFER_API_KEY_PBINVESTING", "k-pbi")
+    monkeypatch.setenv("BUFFER_CHANNEL_YOUTUBE_PBINVESTING", "CH-YT-PB")
+    out = PublishJob(_yt_settings(tmp_path), _job("youtube", account="pbinvesting")).execute()
+    assert out["publications"][0]["provider"] == "buffer"
+    kw = calls[0]
+    assert (kw["platform"], kw["channel_id"], kw["api_key"], kw["title"], kw["youtube_privacy"]) == \
+        ("youtube", "CH-YT-PB", "k-pbi", "t", "public")
+
+
+def test_youtube_with_oauth_keeps_the_worker_upload(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    _pending(tmp_path)
+    mod = types.ModuleType("app.services.youtube_upload")
+    mod.upload_short = lambda **kw: {"video_id": "V", "post_url": "https://youtube.com/shorts/oauth"}
+    monkeypatch.setitem(sys.modules, "app.services.youtube_upload", mod)
+    monkeypatch.setattr(buffer_publish, "publish_video", lambda **kw: pytest.fail("buffer must not be used"))
+    monkeypatch.setenv("BUFFER_CHANNEL_YOUTUBE", "CH-YT")  # a default channel never diverts @moliclips
+    settings = _yt_settings(tmp_path, youtube_client_id="i", youtube_client_secret="s", youtube_refresh_token="r")
+    out = PublishJob(settings, _job("youtube")).execute()
+    assert out["publications"][0]["post_url"].endswith("/oauth")
+
+
+def test_dedicated_youtube_without_oauth_or_channel_fails(tmp_path, monkeypatch):
+    _pending(tmp_path)
+    monkeypatch.setattr(buffer_publish, "publish_video", lambda **kw: pytest.fail("buffer must not be used"))
+    with pytest.raises(RuntimeError, match="YOUTUBE_CLIENT_ID_PBINVESTING missing"):
+        PublishJob(_yt_settings(tmp_path), _job("youtube", account="pbinvesting")).execute()

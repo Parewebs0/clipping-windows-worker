@@ -23,13 +23,17 @@ def _account_key(account_key: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", str(account_key or "default")).strip("_").upper()
 
 
-def _account_env(settings, base_field: str, account_key: str) -> str:
+def _account_env(settings, base_field: str, account_key: str, *, strict: bool = False) -> str:
     """Credential for one account (MOLI-53).
 
     `account_key` 'default' (or a key without an override) reads the legacy
     single-account field, so old deployments work unchanged. Other keys read
     ``<BASE_FIELD>_<KEY>`` from the environment, e.g.
     ``INSTAGRAM_ACCESS_TOKEN_IG2`` for account key ``ig2``.
+
+    ``strict`` (Buffer channels): a non-default key never falls back, so a
+    dedicated account without its own channel fails instead of posting on
+    the shared one.
 
     YouTube does not use this helper. A non-default YouTube account must not
     fall back field by field (that mixes one account's client with another's
@@ -39,7 +43,7 @@ def _account_env(settings, base_field: str, account_key: str) -> str:
     override = ""
     if key and key != "DEFAULT":
         override = (os.environ.get(f"{base_field.upper()}_{key}") or "").strip()
-    if override:
+    if override or (strict and key and key != "DEFAULT"):
         return override
     return (getattr(settings, base_field, None) or "").strip()
 
@@ -77,6 +81,13 @@ def _youtube_credentials(settings, account_key: str) -> dict[str, str]:
         detail = ", ".join(f"{name} missing" for name in missing)
         raise RuntimeError(f"youtube account {key} {detail}")
     return values
+
+
+def _has_youtube_oauth(settings, account_key: str) -> bool:
+    try:
+        return all(_youtube_credentials(settings, account_key).values())
+    except RuntimeError:
+        return False
 
 
 def _assert_past_scheduled_at(payload: dict) -> None:
@@ -142,10 +153,17 @@ class PublishJob(BaseJob):
             }
 
         extra: dict[str, Any] = {}
-        if platform == "youtube":
+        account = str(payload.get("account") or "default")
+        # Buffer key per account or org (BUFFER_API_KEY_<KEY>, else the global key) and channel
+        # per account (BUFFER_CHANNEL_<PLATFORM>_<KEY>): a named account never posts on the default channel.
+        buffer_key = _account_env(self.settings, "buffer_api_key", account)
+        buffer_channel = _account_env(self.settings, f"buffer_channel_{platform}", account, strict=True)
+        # YouTube: OAuth when the account has it (@moliclips unchanged), else Buffer if it has a channel.
+        youtube_by_buffer = platform == "youtube" and bool(buffer_key and buffer_channel) \
+            and not _has_youtube_oauth(self.settings, account)
+        if platform == "youtube" and not youtube_by_buffer:
             from app.services.youtube_upload import upload_short
 
-            account = str(payload.get("account") or "default")
             youtube_creds = _youtube_credentials(self.settings, account)
             uploaded = upload_short(
                 file_path=dest,
@@ -159,17 +177,19 @@ class PublishJob(BaseJob):
             )
             post_url = uploaded["post_url"]
             extra = {"video_id": uploaded.get("video_id"), "account": account}
-        elif (getattr(self.settings, "buffer_api_key", None) or "").strip():
-            # Instagram and TikTok go through Buffer when its key is configured.
+        elif buffer_key:
+            # Instagram and TikTok (and YouTube without OAuth) through Buffer when the account has a key.
             from app.services.buffer_publish import publish_video
 
-            account = str(payload.get("account") or "default")
             uploaded = publish_video(
                 file_path=dest,
                 text=str(caption).strip() or str(title),
                 platform=platform,
-                channel_id=_account_env(self.settings, f"buffer_channel_{platform}", account),
-                api_key=self.settings.buffer_api_key.strip(),
+                channel_id=buffer_channel,
+                api_key=buffer_key,
+                title=str(title),
+                youtube_privacy=getattr(self.settings, "youtube_privacy", None) or "private",
+                youtube_category_id=getattr(self.settings, "buffer_youtube_category_id", None) or "22",
                 public_dir=self.settings.buffer_public_dir or "",
                 public_base_url=self.settings.buffer_public_base_url or "",
                 state_dir=self._publish_state_dir(),
@@ -181,7 +201,6 @@ class PublishJob(BaseJob):
         elif platform == "instagram":
             from app.services.instagram_upload import upload_reel
 
-            account = str(payload.get("account") or "default")
             uploaded = upload_reel(
                 file_path=dest,
                 caption=str(caption),
@@ -199,7 +218,6 @@ class PublishJob(BaseJob):
         else:
             from app.services.tiktok_upload import upload_video
 
-            account = str(payload.get("account") or "default")
             # MOLI-53: TikTok's post text IS the per-platform copy the VPS built
             # (caption already carries mentions/FTC/hashtags, ≤2200). The old
             # title-only path dropped the hashtags entirely.

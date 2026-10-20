@@ -100,6 +100,9 @@ class Settings(BaseSettings):
     buffer_api_key: str | None = None
     buffer_channel_instagram: str | None = None
     buffer_channel_tiktok: str | None = None
+    # YouTube goes through Buffer only for an account without OAuth credentials
+    # that has BUFFER_CHANNEL_YOUTUBE_<KEY>. Buffer requires a category on create.
+    buffer_youtube_category_id: str = "22"
     buffer_public_dir: Path | None = None
     buffer_public_base_url: str | None = None
     buffer_publish_timeout: float = Field(default=1200.0, ge=60.0)

@@ -266,3 +266,12 @@ def test_account_recorded_in_publication_state(tmp_path, fake_uploaders):
     data = json.loads(state.read_text(encoding="utf-8"))
     assert data["publication"]["account"] == "ig2"
     assert fake_uploaders["instagram"].call_args.kwargs["access_token"] == "tok-default"
+
+def test_buffer_channel_of_a_named_account_never_falls_back(tmp_path, monkeypatch):
+    """A dedicated account without its own Buffer channel must fail, not post on the shared one."""
+    settings = _settings(tmp_path)
+    settings.buffer_channel_instagram = "chan-shared"
+    assert _account_env(settings, "buffer_channel_instagram", "default", strict=True) == "chan-shared"
+    assert _account_env(settings, "buffer_channel_instagram", "pbinvesting", strict=True) == ""
+    monkeypatch.setenv("BUFFER_CHANNEL_INSTAGRAM_PBINVESTING", "chan-pb")
+    assert _account_env(settings, "buffer_channel_instagram", "pbinvesting", strict=True) == "chan-pb"
