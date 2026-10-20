@@ -159,6 +159,25 @@ class PublishJob(BaseJob):
             )
             post_url = uploaded["post_url"]
             extra = {"video_id": uploaded.get("video_id"), "account": account}
+        elif (getattr(self.settings, "buffer_api_key", None) or "").strip():
+            # Instagram and TikTok go through Buffer when its key is configured.
+            from app.services.buffer_publish import publish_video
+
+            account = str(payload.get("account") or "default")
+            uploaded = publish_video(
+                file_path=dest,
+                text=str(caption).strip() or str(title),
+                platform=platform,
+                channel_id=_account_env(self.settings, f"buffer_channel_{platform}", account),
+                api_key=self.settings.buffer_api_key.strip(),
+                public_dir=self.settings.buffer_public_dir or "",
+                public_base_url=self.settings.buffer_public_base_url or "",
+                state_dir=self._publish_state_dir(),
+                clip_id=str(clip_id),
+                timeout_s=self.settings.buffer_publish_timeout,
+            )
+            post_url = uploaded["post_url"]
+            extra = {"provider": "buffer", "buffer_post_id": uploaded["buffer_post_id"], "account": account}
         elif platform == "instagram":
             from app.services.instagram_upload import upload_reel
 

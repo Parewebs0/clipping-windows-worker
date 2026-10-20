@@ -94,6 +94,15 @@ class Settings(BaseSettings):
     # inbox: draft in the TikTok app (video.upload). direct: auto-post (video.publish).
     tiktok_mode: str = "inbox"
     tiktok_privacy: str = "SELF_ONLY"
+    # Buffer (GraphQL) publishes Instagram and TikTok when BUFFER_API_KEY is set.
+    # Buffer fetches the video from BUFFER_PUBLIC_BASE_URL/<name>, a public
+    # (Tailscale Funnel) view of BUFFER_PUBLIC_DIR.
+    buffer_api_key: str | None = None
+    buffer_channel_instagram: str | None = None
+    buffer_channel_tiktok: str | None = None
+    buffer_public_dir: Path | None = None
+    buffer_public_base_url: str | None = None
+    buffer_publish_timeout: float = Field(default=1200.0, ge=60.0)
     # Where successful live publications are recorded (idempotency on retries).
     # Default: <working_directory>/publish_state. Must survive restarts.
     publish_state_dir: Path | None = None
@@ -180,7 +189,7 @@ class Settings(BaseSettings):
             return mode
         return value
 
-    @field_validator("publish_state_dir", mode="before")
+    @field_validator("publish_state_dir", "buffer_public_dir", mode="before")
     @classmethod
     def _empty_publish_state_dir_is_default(cls, value: object) -> object:
         # PUBLISH_STATE_DIR= (empty) must mean "default", not Path(".").
