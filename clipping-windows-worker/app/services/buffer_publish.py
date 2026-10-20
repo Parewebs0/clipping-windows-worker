@@ -1,4 +1,4 @@
-"""Instagram and TikTok publishing through Buffer's GraphQL API.
+"""Instagram, TikTok and YouTube Shorts publishing through Buffer's GraphQL API.
 
 Buffer has no upload endpoint: it fetches the video from a public URL. The
 clip is copied under a random name into ``BUFFER_PUBLIC_DIR``, which the mini
@@ -21,7 +21,7 @@ from typing import Any, Callable
 import httpx
 
 API_URL = "https://api.buffer.com"
-PLATFORMS = ("instagram", "tiktok")
+PLATFORMS = ("instagram", "tiktok", "youtube")
 DEFAULT_TIMEOUT_S = 1200.0
 # 250 requests/day per key on Buffer's plans: poll slowly.
 DEFAULT_POLL_S = 30.0
@@ -62,7 +62,10 @@ def _graphql(client: httpx.Client, api_key: str, query: str, variables: dict[str
     return body.get("data") or {}
 
 
-def _post_input(platform: str, channel_id: str, text: str, video_url: str) -> dict[str, Any]:
+def _post_input(
+    platform: str, channel_id: str, text: str, video_url: str, *, title: str = "",
+    youtube_privacy: str = "public", youtube_category_id: str = "22",
+) -> dict[str, Any]:
     data: dict[str, Any] = {
         "channelId": channel_id,
         "text": text,
@@ -72,6 +75,13 @@ def _post_input(platform: str, channel_id: str, text: str, video_url: str) -> di
     }
     if platform == "instagram":
         data["metadata"] = {"instagram": {"type": "reel", "shouldShareToFeed": True}}
+    elif platform == "youtube":
+        # Buffer posts YouTube as Shorts only (vertical, up to 3 min).
+        privacy = youtube_privacy if youtube_privacy in {"public", "private", "unlisted"} else "private"
+        data["metadata"] = {"youtube": {
+            "title": (title or text).strip()[:100], "categoryId": str(youtube_category_id or "22"),
+            "privacy": privacy, "madeForKids": False, "isAiGenerated": False,
+        }}
     return data
 
 
@@ -90,6 +100,9 @@ def publish_video(
     public_base_url: str,
     state_dir: Path,
     clip_id: str,
+    title: str = "",
+    youtube_privacy: str = "public",
+    youtube_category_id: str = "22",
     timeout_s: float = DEFAULT_TIMEOUT_S,
     poll_s: float = DEFAULT_POLL_S,
     client: httpx.Client | None = None,
@@ -123,7 +136,9 @@ def publish_video(
             shutil.copyfile(file_path, public_path)
             video_url = f"{public_base_url.rstrip('/')}/{name}"
             try:
-                data = _graphql(http, api_key, CREATE_POST, {"input": _post_input(platform, channel_id, text, video_url)})
+                data = _graphql(http, api_key, CREATE_POST, {"input": _post_input(
+                    platform, channel_id, text, video_url, title=title,
+                    youtube_privacy=youtube_privacy, youtube_category_id=youtube_category_id)})
             except Exception:
                 public_path.unlink(missing_ok=True)
                 raise
