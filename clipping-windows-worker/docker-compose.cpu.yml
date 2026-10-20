@@ -32,7 +32,8 @@ services:
       STORAGE_CLEANUP_DRY_RUN: ${STORAGE_CLEANUP_DRY_RUN:-true}
       DISK_HIGH_WATERMARK_PCT: "80"
       GOG_PATH: /usr/local/bin/gog
-      # YouTube creds come from .env.cpu; IG/TikTok stay off here.
+      # YouTube creds come from .env.cpu; direct IG/TikTok stay off here.
+      # IG/TikTok go through Buffer when BUFFER_API_KEY is set in .env.cpu.
       INSTAGRAM_ACCESS_TOKEN: ""
       TIKTOK_ACCESS_TOKEN: ""
       OMP_NUM_THREADS: "4"
@@ -42,3 +43,5 @@ services:
       - ${WORKER_MODELS_DIR:-./models-cpu}:/models
       - ${GOG_CONFIG_DIR:-./gog/config}:/root/.config/gogcli
       - ${GOG_SHARE_DIR:-./gog/share}:/root/.local/share/gogcli
+      # Public (Tailscale Funnel) folder Buffer fetches videos from.
+      - ${BUFFER_PUBLIC_DIR:-/srv/datos/apps/clip-public}:${BUFFER_PUBLIC_DIR:-/srv/datos/apps/clip-public}

@@ -28,3 +28,10 @@ def test_instagram_and_tiktok_stay_off():
     env = _service().get("environment") or {}
     assert env.get("INSTAGRAM_ACCESS_TOKEN") == ""
     assert env.get("TIKTOK_ACCESS_TOKEN") == ""
+
+
+def test_buffer_public_dir_is_mounted():
+    vols = _service().get("volumes") or []
+    assert any(v.startswith("${BUFFER_PUBLIC_DIR:-/srv/datos/apps/clip-public}:") for v in vols)
+    env = _service().get("environment") or {}
+    assert "BUFFER_API_KEY" not in env  # comes from .env.cpu
