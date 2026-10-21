@@ -11,9 +11,12 @@ structlog>=24.1.0
 # Transcripción (GPU)
 whisperx>=3.8.0
 
-# Reframe (optional). mode=center does not import these.
-# mediapipe>=0.10.18          # Face Detector, Apache-2.0
-# ultralytics>=8.3.0          # YOLO11 + ByteTrack, AGPL-3.0 (internal use)
+# Reframe. mode=center does not import these.
+# T1 (face mode): MediaPipe Face Detector, Apache-2.0. 1.x works with numpy 2.
+mediapipe>=1.1,<2
+# ultralytics (YOLO11 + ByteTrack, AGPL-3.0) stays out of the image on purpose:
+# face mode does not need it; object/screenshare tracking falls back without it.
+# ultralytics>=8.3.0
 
 # Descarga de vídeos
 yt-dlp>=2026.8.0

@@ -18,11 +18,25 @@ Layouts (used when mode is face, object or auto, or when layout is forced):
 - ``fit`` — full frame letterboxed over a blurred copy of itself
 
 ``layout=auto`` holds a choice for ``hold_s`` (default 0.75 s) before switching.
+
+Face mode (T1, 2026-10-21):
+
+- the window follows one main person: the diarized speaker when known, else
+  the face track with the most screen time × size, else the face nearest to
+  the previous target. When no face is seen the window holds its last spot
+  instead of jumping back to the center;
+- ``zoom`` (on by default in face mode) tightens the single window when the
+  main face is small (wide shot), so the face is about ``target_face_frac`` of
+  the crop height, never past ``max_zoom`` nor below ``min_crop_h`` source
+  pixels. One zoom per clip, so it never pumps;
+- ``mode=face`` never picks ``fit`` (blurred backdrop) on its own, and the
+  single window is scaled to the exact output size: no pad bars.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import subprocess
 import time
 import urllib.request
@@ -177,9 +191,32 @@ def normalize_reframe(raw: dict | None) -> dict[str, Any]:
         "sample_fps": sample_fps,
         "hold_s": hold_s,
         "speakers": speakers,
+        "zoom": _parse_zoom(src.get("zoom"), default_on=mode == "face"),
     }
     if "detections" in src:
         out["detections"] = src.get("detections") or []
+    return out
+
+
+ZOOM_DEFAULTS = {"enabled": False, "target_face_frac": 0.14, "max_zoom": 1.6, "min_crop_h": 640}
+
+
+def _parse_zoom(raw: Any, *, default_on: bool) -> dict[str, Any]:
+    """``zoom: true|false|{enabled, target_face_frac, max_zoom, min_crop_h}``."""
+    out = dict(ZOOM_DEFAULTS, enabled=default_on)
+    if isinstance(raw, bool):
+        out["enabled"] = raw
+        return out
+    if not isinstance(raw, dict):
+        return out
+    if "enabled" in raw:
+        out["enabled"] = bool(raw.get("enabled"))
+    for key, lo, hi in (("target_face_frac", 0.05, 0.5), ("max_zoom", 1.0, 3.0), ("min_crop_h", 240, 4320)):
+        try:
+            out[key] = _clamp(float(raw.get(key, out[key])), lo, hi)
+        except (TypeError, ValueError):
+            pass
+    out["min_crop_h"] = int(out["min_crop_h"])
     return out
 
 
@@ -476,8 +513,10 @@ def smooth_origins(
     src_w: int,
     src_h: int,
     smoothing: Smoothing,
+    cuts: Iterable[float] = (),
 ) -> tuple[list[tuple[int, int]], float]:
-    """Integer crop origins at ``times``. Steps after frame 0 stay within the cap."""
+    """Integer crop origins at ``times``. Steps after frame 0 stay within the cap,
+    except at ``cuts`` (new shots), where the window jumps to the target."""
     max_shift = smoothing.max_shift_frac * float(min(crop_w, crop_h))
     dead = smoothing.deadzone_frac * float(min(crop_w, crop_h))
     if not targets:
@@ -489,10 +528,15 @@ def smooth_origins(
         cx, cy = _interp(targets, t)
         return _clamp_center(cx, cy, crop_w, crop_h, src_w, src_h)
 
+    snaps = set(cut_indices(times, cuts))
     cx, cy = desired(times[0])
     origins = [_origin(cx, cy, crop_w, crop_h, src_w, src_h)]
-    for t in times[1:]:
+    for i, t in enumerate(times[1:], start=1):
         tx, ty = desired(t)
+        if i in snaps:
+            cx, cy = tx, ty
+            origins.append(_origin(cx, cy, crop_w, crop_h, src_w, src_h))
+            continue
         dx, dy = tx - cx, ty - cy
         dist = math.hypot(dx, dy)
         if dist >= dead:
@@ -513,10 +557,22 @@ def smooth_origins(
     return origins, max_shift
 
 
-def _max_step(origins: list[tuple[int, int]]) -> float:
+def cut_indices(times: list[float], cuts: Iterable[float]) -> list[int]:
+    """First output frame at or after each cut (never frame 0)."""
+    out = []
+    for cut in cuts:
+        index = next((i for i, t in enumerate(times) if t >= cut - 1e-6), None)
+        if index:
+            out.append(index)
+    return out
+
+
+def _max_step(origins: list[tuple[int, int]], skip: Iterable[int] = ()) -> float:
+    skipped = set(skip)
     worst = 0.0
-    for left, right in zip(origins, origins[1:]):
-        worst = max(worst, math.hypot(right[0] - left[0], right[1] - left[1]))
+    for i, (left, right) in enumerate(zip(origins, origins[1:]), start=1):
+        if i not in skipped:
+            worst = max(worst, math.hypot(right[0] - left[0], right[1] - left[1]))
     return worst
 
 
@@ -616,6 +672,110 @@ def _static_centers(layout: str, src_w: int, src_h: int) -> dict[str, tuple[floa
     if layout == "screenshare":
         return {"screen": (cx, cy), "face": (cx, cy)}
     return {"single": (cx, cy), "fit": (cx, cy)}
+
+
+def main_track(samples: list[Sample]) -> int | None:
+    """Face track with the most screen time weighted by size: the main person."""
+    score: dict[int, float] = {}
+    for sample in samples:
+        for face in sample.faces:
+            if face.track_id is not None:
+                score[face.track_id] = score.get(face.track_id, 0.0) + face.area
+    if not score:
+        return None
+    return max(score, key=lambda tid: (score[tid], -tid))
+
+
+def _nearest(faces: list[Det], x: float, y: float) -> Det:
+    return min(faces, key=lambda f: (f.x - x) ** 2 + (f.y - y) ** 2)
+
+
+def _subject_targets(
+    samples: list[Sample],
+    *,
+    speakers: list[dict],
+    mapping: dict[str, int],
+    src_w: int,
+    src_h: int,
+    use_objects: bool,
+) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float, float]], list[tuple[float, float]]]:
+    """Targets for the single window, the real faces it followed (t, x, y, h)
+    and jumps (t, distance px) where it moved to a face track never seen before
+    (a new shot: the caller snaps instead of panning when the jump is large).
+
+    Order of preference per sample: the diarized speaker's face, the main
+    track, the face nearest to the last target, the largest face. With no
+    face the window holds its last target (center before the first face).
+    """
+    main = main_track(samples)
+    targets: list[tuple[float, float, float]] = []
+    followed: list[tuple[float, float, float, float]] = []
+    jumps: list[tuple[float, float]] = []
+    seen: set[int] = set()
+    last: tuple[float, float] | None = None
+    for sample in samples:
+        fresh = {f.track_id for f in sample.faces if f.track_id is not None} - seen
+        seen |= fresh
+        spk = speaker_at(sample.t, speakers)
+        tid = mapping.get(spk) if spk else None
+        face = None
+        for wanted in (tid, main):
+            if face is None and wanted is not None:
+                face = next((f for f in sample.faces if f.track_id == wanted), None)
+        if face is None and sample.faces:
+            face = _nearest(sample.faces, *last) if last else max(sample.faces, key=lambda f: f.area)
+        if face is None and use_objects and sample.objects:
+            obj = max(sample.objects, key=lambda item: item.score * item.area)
+            targets.append((sample.t, obj.x, obj.y))
+            last = (obj.x, obj.y)
+            continue
+        if face is None:
+            cx, cy = last or _center_of(src_w, src_h)
+            targets.append((sample.t, cx, cy))
+            continue
+        if last is not None and face.track_id in fresh:
+            jumps.append((sample.t, math.hypot(face.x - last[0], face.y - last[1])))
+        targets.append((sample.t, face.x, face.y))
+        followed.append((sample.t, face.x, face.y, face.h))
+        last = (face.x, face.y)
+    if not targets:
+        targets = [(0.0, *_center_of(src_w, src_h))]
+    return targets, followed, jumps
+
+
+def zoom_for(face_heights: list[float], crop_h: int, zoom: dict[str, Any]) -> float:
+    """Zoom so the median face is ``target_face_frac`` of the crop (1.0 = none)."""
+    if not zoom.get("enabled") or not face_heights or crop_h <= 0:
+        return 1.0
+    ordered = sorted(face_heights)
+    median = ordered[len(ordered) // 2]
+    if median <= 0:
+        return 1.0
+    want = float(zoom["target_face_frac"]) * crop_h / median
+    limit = min(float(zoom["max_zoom"]), crop_h / max(1.0, float(zoom["min_crop_h"])))
+    value = min(want, limit)
+    return round(value, 3) if value > 1.02 else 1.0
+
+
+def centered_ratio(
+    followed: list[tuple[float, float, float, float]],
+    origins: list[tuple[int, int]],
+    times: list[float],
+    crop_w: int,
+    crop_h: int,
+    *,
+    band: float = 0.25,
+) -> float | None:
+    """Share of followed faces whose center sits in the middle half of the window."""
+    if not followed or not origins:
+        return None
+    hits = 0
+    for t, x, y, _h in followed:
+        index = min(range(len(times)), key=lambda i: abs(times[i] - t))
+        ox, oy = origins[index]
+        if abs(x - (ox + crop_w / 2)) <= band * crop_w and oy <= y <= oy + crop_h:
+            hits += 1
+    return hits / len(followed)
 
 
 def _targets_for(
@@ -733,7 +893,7 @@ def _layout_chain(
         x0, y0 = paths["single"]["origins"][0]
         return _chain_label(
             src_label,
-            f"crop@single={cw}:{ch}:{x0}:{y0},{_scale_pad(slot_w, slot_h)}",
+            f"crop@single={cw}:{ch}:{x0}:{y0},scale={slot_w}:{slot_h},setsar=1",
             out_label,
         )
     if layout == "split":
@@ -817,11 +977,13 @@ def _build_graph(
         cw, ch = paths["single"]["crop"]
         ow, oh = output_size(fmt)
         x0, y0 = paths["single"]["origins"][0]
+        # Exact scale, not decrease+pad: even-pixel rounding of the crop left
+        # 1-2 px black lines top/bottom. The aspect error is under 0.3%.
         vf = [
             "sendcmd=f=reframe.cmd",
             f"crop={cw}:{ch}:{x0}:{y0}",
-            f"scale={ow}:{oh}:force_original_aspect_ratio=decrease",
-            f"pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2",
+            f"scale={ow}:{oh}",
+            "setsar=1",
         ]
         # Untargeted-style commands use the filter name `crop` (one crop only).
         return vf, None, [(t, "crop", x, y) for t, _target, x, y in events]
@@ -934,6 +1096,17 @@ def _compile(
     else:
         spans = [{"start": 0.0, "end": round(duration, 3), "layout": cfg["layout"]}]
 
+    if cfg["mode"] == "face" and cfg["layout"] == "auto":
+        # Face mode never shrinks the shot into a blurred backdrop on its own.
+        merged: list[dict] = []
+        for span in spans:
+            span = dict(span, layout="single" if span["layout"] == "fit" else span["layout"])
+            if merged and merged[-1]["layout"] == span["layout"]:
+                merged[-1]["end"] = span["end"]
+            else:
+                merged.append(span)
+        spans = merged
+
     used = []
     for span in spans:
         if span["layout"] not in used:
@@ -948,17 +1121,36 @@ def _compile(
     paths: dict[str, dict] = {}
     max_shift = 0.0
     observed = 0.0
+    zoom = 1.0
+    followed: list[tuple[float, float, float, float]] = []
+    cuts: list[float] = []
     for layout in used:
         for name, slot_w, slot_h in _slot_sizes(fmt, layout):
             if name == "fit":
                 continue
             cw, ch = _crop_for_slot(src_w, src_h, slot_w, slot_h)
-            targets = _targets_for(
-                name, samples, layout=layout, speakers=speakers, mapping=mapping,
-                src_w=src_w, src_h=src_h, screen_box=screen,
-            )
+            if name == "single":
+                targets, followed, jumps = _subject_targets(
+                    samples, speakers=speakers, mapping=mapping, src_w=src_w, src_h=src_h,
+                    use_objects=cfg["mode"] != "face",
+                )
+                zoom = zoom_for([h for *_rest, h in followed], ch, cfg["zoom"])
+                if zoom > 1.0:
+                    cw, ch = _even(cw / zoom), _even(ch / zoom)
+                if cfg["mode"] == "face":
+                    # Eyes a bit above the middle: the face sits at ~40% of the window height.
+                    targets = [(t, x, y + ch * 0.10) for t, x, y in targets]
+                    # New shot far away: jump there instead of panning across.
+                    cuts = [t for t, dist in jumps if dist > 0.5 * cw]
+            else:
+                targets = _targets_for(
+                    name, samples, layout=layout, speakers=speakers, mapping=mapping,
+                    src_w=src_w, src_h=src_h, screen_box=screen,
+                )
+            slot_cuts = cuts if name == "single" else []
             origins, cap = smooth_origins(
                 targets, times, crop_w=cw, crop_h=ch, src_w=src_w, src_h=src_h, smoothing=smoothing,
+                cuts=slot_cuts,
             )
             paths[name] = {
                 "layout": layout,
@@ -969,16 +1161,21 @@ def _compile(
             }
             if name in ("single", "face"):
                 max_shift = cap
-                observed = max(observed, _max_step(origins))
+                observed = max(observed, _max_step(origins, cut_indices(times, slot_cuts)))
             elif layout == "split":
                 max_shift = max(max_shift, cap)
                 observed = max(observed, _max_step(origins))
 
     # A single window that never leaves the center is the historical crop.
-    if used == ["single"] and "single" in paths and fmt in ("9:16", "16:9"):
+    if used == ["single"] and "single" in paths and fmt in ("9:16", "16:9") and zoom == 1.0:
         cw, ch = paths["single"]["crop"]
         if _path_is_center(paths["single"]["origins"], src_w, src_h, cw, ch):
             return None
+
+    centered = None
+    if "single" in paths:
+        cw, ch = paths["single"]["crop"]
+        centered = centered_ratio(followed, paths["single"]["origins"], times, cw, ch)
 
     ratio = None
     if "single" in paths:
@@ -1001,6 +1198,11 @@ def _compile(
         "max_shift_observed_px": round(observed, 3),
         "speaker_in_frame": None if ratio is None else round(ratio, 4),
         "crop": paths.get("single", paths.get("face", {})).get("crop"),
+        "zoom": zoom,
+        "main_track": main_track(samples),
+        "subject_centered": None if centered is None else round(centered, 4),
+        "subject_frames": len(followed),
+        "cuts": [round(t, 3) for t in cuts],
     }
 
 
@@ -1021,6 +1223,9 @@ def _gpu_info() -> dict[str, Any]:
 
 
 def _ensure_face_model(model_dir: Path) -> Path | None:
+    baked = os.environ.get("REFRAME_FACE_MODEL", "").strip()
+    if baked and Path(baked).is_file() and Path(baked).stat().st_size > 0:
+        return Path(baked)
     dest = model_dir / _FACE_MODEL_NAME
     if dest.is_file() and dest.stat().st_size > 0:
         return dest
@@ -1035,10 +1240,10 @@ def _ensure_face_model(model_dir: Path) -> Path | None:
 
 def _open_face_detector(model_dir: Path):
     try:
-        import mediapipe as mp
+        import mediapipe as mp  # noqa: F401
         from mediapipe.tasks.python import BaseOptions
         from mediapipe.tasks.python.vision import FaceDetector, FaceDetectorOptions
-    except ImportError:
+    except (ImportError, OSError):
         logger.info("mediapipe is not installed; face tracking unavailable")
         return None
     model = _ensure_face_model(model_dir)
@@ -1048,7 +1253,11 @@ def _open_face_detector(model_dir: Path):
         base_options=BaseOptions(model_asset_path=str(model)),
         min_detection_confidence=0.5,
     )
-    return FaceDetector.create_from_options(options)
+    try:
+        return FaceDetector.create_from_options(options)
+    except Exception as exc:  # noqa: BLE001 — e.g. libEGL missing: fall back to center, do not drop the plan
+        logger.warning("face detector unavailable", error=str(exc))
+        return None
 
 
 def _detect_faces(detector, rgb, det_w: int, det_h: int, src_w: int, src_h: int, t: float) -> list[Det]:
@@ -1349,6 +1558,9 @@ def _base_meta(cfg: dict[str, Any]) -> dict[str, Any]:
         "speaker_in_frame": None,
         "max_shift_px": None,
         "max_shift_observed_px": None,
+        "zoom": 1.0,
+        "main_track": None,
+        "subject_centered": None,
         "note": _GPU_NOTE,
     }
 
@@ -1417,6 +1629,11 @@ def plan_reframe(
     meta["speaker_in_frame"] = compiled["speaker_in_frame"]
     meta["max_shift_px"] = compiled["max_shift_px"]
     meta["max_shift_observed_px"] = compiled["max_shift_observed_px"]
+    meta["zoom"] = compiled["zoom"]
+    meta["main_track"] = compiled["main_track"]
+    meta["subject_centered"] = compiled["subject_centered"]
+    meta["subject_frames"] = compiled["subject_frames"]
+    meta["cuts"] = compiled["cuts"]
     if compiled["crop"]:
         meta["crop"] = {"w": compiled["crop"][0], "h": compiled["crop"][1]}
 
