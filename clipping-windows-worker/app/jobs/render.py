@@ -352,6 +352,10 @@ class RenderJob(BaseJob):
                     continue
             if speakers:
                 reframe_cfg["speakers"] = speakers
+        subject = reframe_cfg.get("subject")
+        if isinstance(subject, dict) and subject.get("references") and not subject.get("reference_paths"):
+            reframe_cfg = dict(reframe_cfg)
+            reframe_cfg["subject"] = {**subject, "reference_paths": self._subject_references(subject["references"])}
         work_dir = captions_file.parent if captions_file else self.directory.output
         src_w, src_h = (0, 0)
         if needs_source_size(reframe_cfg, output_format):
@@ -602,6 +606,26 @@ class RenderJob(BaseJob):
                 raise ValueError(f"logo URL is not a raster image ({ctype or 'unknown'}): {url}")
             dest.write_bytes(r.content)
         return dest
+
+    def _subject_references(self, refs: list[Any]) -> list[str]:
+        """T1b: local paths of the subject's reference faces (downloaded from the VPS).
+
+        A reference that fails to download is skipped; with none left the
+        reframe keeps plain T1 behaviour.
+        """
+        paths: list[str] = []
+        for i, ref in enumerate(list(refs)[:8]):
+            ref = str(ref or "").strip()
+            if not ref:
+                continue
+            if Path(ref).is_file():
+                paths.append(ref)
+                continue
+            try:
+                paths.append(str(self._download_brand(ref, (f"subject_{i}", ".jpg"))))
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("subject reference download failed", url=ref, error=str(exc))
+        return paths
 
     def _download_brand(self, url: str, name_hint: tuple[str, ...]) -> Path:
         """Descarga un asset de marca (fuente TTF/OTF o tarjeta intro/outro).

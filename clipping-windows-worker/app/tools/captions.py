@@ -433,6 +433,17 @@ def _censor_words(items: list[dict[str, Any]], phrases: list[str]) -> tuple[list
     return out, spans
 
 
+_SENTENCE_END = re.compile(r"[.!?\u2026;:]+[\"'\u201d\u2019)\]]*$")
+_COMMA_END = re.compile(r",[\"'\u201d\u2019)\]]*$")
+
+
+def _ends_clause(text: str, words_in_line: int) -> bool:
+    """Line break after this word: sentence punctuation, or a comma once the line has 2 words."""
+    if _SENTENCE_END.search(text):
+        return True
+    return words_in_line >= 2 and bool(_COMMA_END.search(text))
+
+
 def _group_lines(items: list[dict[str, Any]], *, max_words: int, duration: float | None,
                  max_chars: int | None = None) -> list[dict[str, Any]]:
     lines: list[dict[str, Any]] = []
@@ -455,6 +466,8 @@ def _group_lines(items: list[dict[str, Any]], *, max_words: int, duration: float
 
     for item in items:
         speaker = item.get("speaker")
+        if buf and _ends_clause(buf[-1]["text"], len(buf)):
+            flush()  # T2b: never carry a sentence end into the next words ("swear. I")
         chars = sum(len(w["text"]) + 1 for w in buf) + len(item["text"])
         if buf and (
             len(buf) >= max_words
