@@ -10,6 +10,12 @@ relativos) y el diccionario de marca. Aquí:
 estático de siempre. `karaoke`, `pop` y `bold` resaltan la palabra activa
 con los tiempos de WhisperX (cuantizados a centésimas, error ≤ 80 ms).
 
+`shorts` (T2) parte de `pop`: blanco con borde grueso, 2-3 palabras en una
+sola línea y la palabra activa en amarillo. El texto vive en la franja
+0.70-0.78 de la altura y deja libres los márgenes laterales, fuera de la
+interfaz de TikTok/Reels (`UI_ZONES`). El resumen trae `safe_zone` con la
+caja estimada del texto y las zonas de interfaz que pisa.
+
 Los emojis no van dentro del ASS: libass no pinta emoji a color. El resumen
 trae `emoji_cues` para que el render los superponga como PNG (Twemoji).
 """
@@ -22,7 +28,19 @@ from typing import Any, Iterable
 
 _WORD = re.compile(r"\S+")
 
-PRESETS = ("classic", "karaoke", "pop", "bold")
+PRESETS = ("classic", "karaoke", "pop", "bold", "shorts")
+
+# TikTok/Reels interface on a 9:16 frame, as fractions (x0, y0, x1, y1):
+# status/tabs on top, caption + buttons at the bottom, action rail on the right.
+UI_ZONES = {
+    "top_bar": (0.0, 0.0, 1.0, 0.08),
+    "bottom_bar": (0.0, 0.80, 1.0, 1.0),
+    "right_rail": (0.86, 0.35, 1.0, 0.80),
+}
+# Caption band the `shorts` preset keeps to (top, bottom).
+SAFE_BAND = (0.70, 0.78)
+# Montserrat Bold: average advance per character, in em (mixed case).
+_CHAR_EM = 0.62
 
 # Family name → file shipped under app/assets/fonts (OFL).
 _FONT_FILES = {
@@ -84,6 +102,25 @@ _PRESET_VISUAL = {
         "primary": "&H0000FFFF",
         "secondary": "&H00FFFFFF",
         "highlight": "&H0000FFFF",
+    },
+    # T2: pop look tuned for TikTok/Reels. Layout keys are defaults that
+    # explicit style keys (size, margin_v, max_words) still override.
+    "shorts": {
+        "font": "Montserrat",
+        "uppercase": False,
+        "outline": 9,
+        "shadow": 2,
+        "bold": -1,
+        "mode": "pop",
+        "primary": "&H00FFFFFF",
+        "secondary": "&H00FFFFFF",
+        "highlight": "&H0000FFFF",
+        "pop_scale": 112,
+        "max_words": 3,
+        "size_frac": 0.046,
+        "margin_v_frac": 0.225,
+        "side_frac": 0.14,
+        "single_line": True,
     },
 }
 
@@ -211,18 +248,20 @@ def caption_search_window(width: int, height: int, style: dict[str, Any] | None)
     """
     src = style if isinstance(style, dict) else {}
     visual = resolve_caption_style(src)
+    size_default = round(height * float(visual.get("size_frac", 0.038)))
+    margin_default = round(height * float(visual.get("margin_v_frac", 0.22)))
     try:
-        size = int(src.get("size") or round(height * 0.038))
+        size = int(src.get("size") or size_default)
     except (TypeError, ValueError):
-        size = round(height * 0.038)
+        size = size_default
     size = max(8, min(int(size), max(8, height)))
     if src.get("margin_v") is None:
-        margin_v = round(height * 0.22)
+        margin_v = margin_default
     else:
         try:
             margin_v = int(src.get("margin_v"))
         except (TypeError, ValueError):
-            margin_v = round(height * 0.22)
+            margin_v = margin_default
     outline = int(visual.get("outline") or 6)
     shadow = int(visual.get("shadow") or 0)
     position = str(src.get("position") or "bottom").strip().lower()
@@ -394,7 +433,8 @@ def _censor_words(items: list[dict[str, Any]], phrases: list[str]) -> tuple[list
     return out, spans
 
 
-def _group_lines(items: list[dict[str, Any]], *, max_words: int, duration: float | None) -> list[dict[str, Any]]:
+def _group_lines(items: list[dict[str, Any]], *, max_words: int, duration: float | None,
+                 max_chars: int | None = None) -> list[dict[str, Any]]:
     lines: list[dict[str, Any]] = []
     buf: list[dict[str, Any]] = []
 
@@ -415,8 +455,10 @@ def _group_lines(items: list[dict[str, Any]], *, max_words: int, duration: float
 
     for item in items:
         speaker = item.get("speaker")
+        chars = sum(len(w["text"]) + 1 for w in buf) + len(item["text"])
         if buf and (
             len(buf) >= max_words
+            or (max_chars is not None and chars > max_chars)
             or (speaker and buf[0].get("speaker") and speaker != buf[0].get("speaker"))
         ):
             flush()
@@ -488,17 +530,23 @@ def _pop_body(line: dict[str, Any], active: int, visual: dict[str, Any], *, uppe
               keywords: set[str], speaker_colour: str) -> str:
     base = speaker_colour or "&H00FFFFFF"
     highlight = visual["highlight"]
+    peak = int(visual.get("pop_scale", 132))
+    settle = 100 + (peak - 100) // 4
+    fs = line.get("fs")
+    reset = f"{{\\r\\fs{fs}}}" if fs else "{\\r}"
     chunks: list[str] = []
     for i, word in enumerate(line["words"]):
         shown = _esc(_display(word["text"], uppercase=uppercase))
         if i == active:
             chunks.append(
-                f"{{\\c{highlight}&\\fscx100\\fscy100\\t(0,90,\\fscx132\\fscy132)\\t(90,180,\\fscx108\\fscy108)}}{shown}{{\\r}}"
+                f"{{\\c{highlight}&\\fscx100\\fscy100\\t(0,90,\\fscx{peak}\\fscy{peak})"
+                f"\\t(90,180,\\fscx{settle}\\fscy{settle})}}{shown}{reset}"
             )
         else:
             weight = "\\b1" if _keyword_hit(word["text"], keywords) else ""
-            chunks.append(f"{{\\c{base}&{weight}}}{shown}{{\\r}}")
-    return " ".join(chunks)
+            chunks.append(f"{{\\c{base}&{weight}}}{shown}{reset}")
+    body = " ".join(chunks)
+    return f"{{\\fs{fs}}}{body}" if fs else body
 
 
 def _styled_dialogues(lines: list[dict[str, Any]], visual: dict[str, Any], *, uppercase: bool,
@@ -629,16 +677,17 @@ def _ass_colour(value: Any, default: str) -> str:
 
 def _header(*, width: int, height: int, font: str, size: int, primary: str, secondary: str,
             outline: int, shadow: int, bold: int, align: int, margin_v: int, ost_size: int,
-            outline_colour: str = "&H00000000", overlay_primary: str = "&H00FFFFFF") -> str:
+            outline_colour: str = "&H00000000", overlay_primary: str = "&H00FFFFFF",
+            margin_lr: int = 60, wrap_style: int = 0) -> str:
     return (
         "[Script Info]\nScriptType: v4.00+\n"
-        f"PlayResX: {width}\nPlayResY: {height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n"
+        f"PlayResX: {width}\nPlayResY: {height}\nWrapStyle: {wrap_style}\nScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
         "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
         "MarginR, MarginV, Encoding\n"
         f"Style: Caption,{font},{size},{primary},{secondary},{outline_colour},&H64000000,{bold},0,0,0,100,100,0,0,1,{outline},{shadow},"
-        f"{align},60,60,{margin_v},1\n"
+        f"{align},{margin_lr},{margin_lr},{margin_v},1\n"
         f"Style: Overlay,{font},{ost_size},{overlay_primary},{overlay_primary},{outline_colour},&HA0000000,-1,0,0,0,100,100,0,0,3,4,0,"
         f"8,60,60,{round(height * 0.12)},1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -671,12 +720,61 @@ def _overlay_lines(ost: dict[str, Any], *, duration: float, width: int, height: 
 
 
 def _prepare_lines(cap: dict[str, Any], *, max_words: int, duration: float,
-                   censor_words: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, float]]]:
+                   censor_words: list[str], max_chars: int | None = None) -> tuple[list[dict[str, Any]], list[dict[str, float]]]:
     raw = _raw_words(cap.get("segments"), duration=duration)
     branded = _brand_words(raw, cap.get("brand_dictionary") or [])
     censored, spans = _censor_words(branded, censor_words)
-    lines = _group_lines(censored, max_words=max_words, duration=duration)
+    lines = _group_lines(censored, max_words=max_words, duration=duration, max_chars=max_chars)
     return lines, spans
+
+
+def line_chars(width: int, size: int, margin_lr: int, *, pop_scale: int = 100) -> int:
+    """Characters that fit on one line between the side margins (active word popped)."""
+    usable = max(1, width - 2 * margin_lr)
+    per_char = max(1.0, size * _CHAR_EM * pop_scale / 100.0)
+    return max(4, int(usable / per_char))
+
+
+def _fit_long_lines(lines: list[dict[str, Any]], *, max_chars: int, size: int) -> None:
+    """A single word longer than the line gets a smaller \\fs instead of wrapping."""
+    for line in lines:
+        chars = len(" ".join(w["text"] for w in line["words"]))
+        if chars > max_chars:
+            line["fs"] = max(8, int(size * max_chars / chars))
+
+
+def safe_zone(*, width: int, height: int, size: int, margin_v: int, margin_lr: int,
+              outline: int, align: int, max_line_frac: float = 1.0) -> dict[str, Any]:
+    """Estimated caption box (fractions of the frame) and the UI zones it touches.
+
+    One line, bottom-anchored: the box spans the usable width between margins
+    (worst case) and one line of text plus outline above MarginV.
+    """
+    line_h = size * 1.2 + 2 * outline
+    if align == 2:
+        bottom = (height - margin_v + outline) / height
+        top = bottom - line_h / height
+    elif align == 8:
+        top = (margin_v - outline) / height
+        bottom = top + line_h / height
+    else:
+        top = (height - line_h) / 2 / height
+        bottom = top + line_h / height
+    half = (width - 2 * margin_lr) * max_line_frac / 2 / width
+    left, right = 0.5 - half, 0.5 + half
+    overlap = [
+        name for name, (x0, y0, x1, y1) in UI_ZONES.items()
+        if left < x1 and right > x0 and top < y1 and bottom > y0
+    ]
+    return {
+        "top": round(top, 4),
+        "bottom": round(bottom, 4),
+        "left": round(left, 4),
+        "right": round(right, 4),
+        "band": list(SAFE_BAND),
+        "in_band": top >= SAFE_BAND[0] - 1e-6 and bottom <= SAFE_BAND[1] + 1e-6,
+        "ui_overlap": overlap,
+    }
 
 
 def build_ass(*, width: int, height: int, captions: dict[str, Any] | None, on_screen_text: dict[str, Any] | None,
@@ -708,9 +806,11 @@ def build_ass(*, width: int, height: int, captions: dict[str, Any] | None, on_sc
     )
     # Brand font wins over the preset family so libass loads the downloaded file.
     font = br.get("font_name") or visual["font"]
-    size = int(style.get("size", round(height * 0.038)))
+    size = int(style.get("size") or round(height * float(visual.get("size_frac", 0.038))))
     cap_align = _POS_ALIGN.get(style.get("position", "bottom"), 2)
-    cap_margin_v = int(style.get("margin_v", round(height * 0.22)))
+    cap_margin_v = int(style.get("margin_v") or round(height * float(visual.get("margin_v_frac", 0.22))))
+    single_line = bool(visual.get("single_line"))
+    margin_lr = round(width * float(visual["side_frac"])) if "side_frac" in visual else 60
     primary = _ass_colour(br.get("caption_color"), visual["primary"])
     secondary = primary if br.get("caption_color") else visual["secondary"]
     outline_c = _ass_colour(br.get("outline_color"), "&H00000000")
@@ -722,25 +822,35 @@ def build_ass(*, width: int, height: int, captions: dict[str, Any] | None, on_sc
         outline=int(visual["outline"]), shadow=int(visual["shadow"]), bold=int(visual["bold"]),
         align=cap_align, margin_v=cap_margin_v, ost_size=ost_size,
         outline_colour=outline_c, overlay_primary=overlay_primary,
+        margin_lr=margin_lr, wrap_style=2 if single_line else 0,
     )
     summary: dict[str, Any] = {
         "captions": {"applied": False, "events": 0, "preset": visual["name"]},
         "on_screen_text": {"applied": False, "texts": []},
     }
     dialogues: list[str] = []
-    max_words = int(style.get("max_words", 4))
+    max_words = int(style.get("max_words") or visual.get("max_words", 4))
+    max_chars = None
+    if single_line:
+        max_chars = line_chars(width, size, margin_lr, pop_scale=int(visual.get("pop_scale", 100)))
     emoji_on = _emoji_enabled(style.get("emoji"))
     need_lines = (not plain_classic) or emoji_on
     lines: list[dict[str, Any]] = []
     spans: list[dict[str, float]] = []
+    shown_texts: list[str] = []
     if cap.get("enabled") and cap.get("segments") and need_lines:
-        lines, spans = _prepare_lines(cap, max_words=max_words, duration=duration, censor_words=censor_words)
+        lines, spans = _prepare_lines(
+            cap, max_words=max_words, duration=duration, censor_words=censor_words, max_chars=max_chars,
+        )
+        if max_chars is not None:
+            _fit_long_lines(lines, max_chars=max_chars, size=size)
 
     if cap.get("enabled") and cap.get("segments") and plain_classic:
         evs = caption_events(
             cap["segments"], max_words=max_words, duration=duration,
             dictionary=cap.get("brand_dictionary") or [],
         )
+        shown_texts = [t for _, _, t in evs]
         for a, b, t in evs:
             dialogues.append(f"Dialogue: 0,{_ts(a)},{_ts(b)},Caption,,0,0,0,,{_esc(t)}")
         summary["captions"] = {
@@ -756,6 +866,7 @@ def build_ass(*, width: int, height: int, captions: dict[str, Any] | None, on_sc
             lines, visual, uppercase=bool(visual["uppercase"]), keywords=keywords, speaker_ids=speaker_ids,
         )
         dialogues.extend(cap_dialogues)
+        shown_texts = texts
         summary["captions"] = {
             "applied": bool(cap_dialogues),
             "events": len(cap_dialogues),
@@ -766,6 +877,16 @@ def build_ass(*, width: int, height: int, captions: dict[str, Any] | None, on_sc
         }
 
     cap_summary = summary["captions"]
+    longest = max((len(t) for t in shown_texts), default=0)
+    if max_chars is not None:
+        longest = min(longest, max_chars)  # longer lines were shrunk with \fs
+    pop = int(visual.get("pop_scale", 100)) if visual["mode"] == "pop" else 100
+    usable = max(1, width - 2 * margin_lr)
+    line_frac = min(1.0, longest * size * _CHAR_EM * pop / 100.0 / usable) if longest else 1.0
+    cap_summary["safe_zone"] = safe_zone(
+        width=width, height=height, size=size, margin_v=cap_margin_v, margin_lr=margin_lr,
+        outline=int(visual["outline"]), align=cap_align, max_line_frac=line_frac,
+    )
     if br.get("font_name"):
         cap_summary["font"] = str(br["font_name"])
     if censor_words:

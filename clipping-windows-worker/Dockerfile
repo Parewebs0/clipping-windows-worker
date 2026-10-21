@@ -5,6 +5,7 @@ ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core ca-certificates \
+      libgl1 libglib2.0-0 libegl1 libgles2 \
  && rm -rf /var/lib/apt/lists/*
 # CPU-only torch: the cpu index wins (x.y.z+cpu sorts above x.y.z), so
 # whisperx does not pull the CUDA wheels.
@@ -12,6 +13,17 @@ COPY requirements.txt .
 RUN pip install --index-url https://download.pytorch.org/whl/cpu \
       --extra-index-url https://pypi.org/simple -r requirements.txt \
  && python -c "import torch; assert '+cpu' in torch.__version__, torch.__version__"
+
+# Face detector model for reframe face mode (T1). Baked outside /models, which
+# compose mounts as a volume. mediapipe needs libgl1/libglib2.0-0 (opencv) and
+# libegl1/libgles2 (loaded even on CPU).
+ARG FACE_MODEL_URL=https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_full_range/float16/latest/blaze_face_full_range.tflite
+ARG FACE_MODEL_SHA256=3698b18f063835bc609069ef052228fbe86d9c9a6dc8dcb7c7c2d69aed2b181b
+ENV REFRAME_FACE_MODEL=/opt/reframe-models/blaze_face_full_range.tflite
+RUN mkdir -p /opt/reframe-models \
+ && python -c "import urllib.request as u; u.urlretrieve('${FACE_MODEL_URL}', '${REFRAME_FACE_MODEL}')" \
+ && echo "${FACE_MODEL_SHA256}  ${REFRAME_FACE_MODEL}" | sha256sum -c - \
+ && python -c "from mediapipe.tasks.python.vision import FaceDetector; print('mediapipe ok')"
 
 # gog CLI for Drive downloads; config/keyring are bind-mounted (see compose).
 ARG GOG_VERSION=0.40.0
