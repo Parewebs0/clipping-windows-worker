@@ -103,6 +103,9 @@ class Det:
     label: str = "face"
     track_id: int | None = None
     mouth: float = 0.0
+    ident: float | None = None  # T1b: cosine vs the campaign subject (None = not measured)
+    subject: bool = False       # T1b: the track was recognised as the subject
+    subject_score: float = 0.0  # T1b: the track's identity score (mean of its best matches)
 
     @property
     def area(self) -> float:
@@ -193,9 +196,84 @@ def normalize_reframe(raw: dict | None) -> dict[str, Any]:
         "speakers": speakers,
         "zoom": _parse_zoom(src.get("zoom"), default_on=mode == "face"),
     }
+    subject = _parse_subject(src.get("subject"))
+    if subject:
+        out["subject"] = subject
     if "detections" in src:
         out["detections"] = src.get("detections") or []
     return out
+
+
+def _parse_subject(raw: Any) -> dict[str, Any] | None:
+    """``subject: {name, reference_paths[], threshold}``. Needs local reference images."""
+    if not isinstance(raw, dict):
+        return None
+    paths = [str(p) for p in raw.get("reference_paths") or [] if str(p or "").strip()]
+    if not paths:
+        return None
+    try:
+        threshold = _clamp(float(raw.get("threshold") or SUBJECT_MATCH), 0.2, 0.9)
+    except (TypeError, ValueError):
+        threshold = SUBJECT_MATCH
+    return {"name": str(raw.get("name") or "subject")[:80], "reference_paths": paths[:8], "threshold": threshold}
+
+
+# T1b: SFace cosine for "same person" and the share of a track's measured faces
+# that must match before the whole track counts as the subject.
+SUBJECT_MATCH = 0.363
+SUBJECT_TRACK_SHARE = 0.3
+# A lookalike can pass the absolute SFace threshold (0.36-0.43 seen against
+# Speed's references while Speed himself scores 0.7-0.85), so a track must
+# also score close to the best-matching track of the clip.
+SUBJECT_RELATIVE = 0.55
+SUBJECT_TOP_K = 3
+SUBJECT_EVERY_S = 0.25
+
+
+def label_subject_tracks(samples: list[Sample], threshold: float = SUBJECT_MATCH) -> list[int]:
+    """Mark every face of a track whose measured faces match the subject often enough.
+
+    Recognition only sees frontal faces, so one track is judged as a whole: a
+    profile in the middle of a recognised track still counts as the subject.
+    """
+    seen: dict[int, list[float]] = {}
+    for sample in samples:
+        for face in sample.faces:
+            if face.track_id is not None and face.ident is not None:
+                seen.setdefault(face.track_id, []).append(face.ident)
+    scores = {tid: sum(top) / len(top) for tid, sims in seen.items()
+              for top in [sorted(sims, reverse=True)[:SUBJECT_TOP_K]]}
+    best = max(scores.values(), default=0.0)
+    floor = max(threshold, SUBJECT_RELATIVE * best)
+    tracks = sorted(
+        tid for tid, sims in seen.items()
+        if scores[tid] >= floor
+        and sum(1 for v in sims if v >= threshold) >= max(1, round(SUBJECT_TRACK_SHARE * len(sims)))
+    )
+    for sample in samples:
+        for face in sample.faces:
+            face.subject = face.track_id in tracks
+            face.subject_score = scores.get(face.track_id, 0.0) if face.subject else 0.0
+    return tracks
+
+
+def subject_on_screen(
+    samples: list[Sample], origins: list[tuple[int, int]], times: list[float], crop_w: int, crop_h: int,
+) -> tuple[float | None, float | None]:
+    """(share of samples with the subject anywhere, share with the subject inside the window)."""
+    if not samples or not origins:
+        return None, None
+    present = inside = 0
+    for sample in samples:
+        faces = [f for f in sample.faces if f.subject]
+        if not faces:
+            continue
+        present += 1
+        index = min(range(len(times)), key=lambda i: abs(times[i] - sample.t))
+        ox, oy = origins[index]
+        if any(ox <= f.x <= ox + crop_w and oy <= f.y <= oy + crop_h for f in faces):
+            inside += 1
+    return present / len(samples), inside / len(samples)
 
 
 ZOOM_DEFAULTS = {"enabled": False, "target_face_frac": 0.14, "max_zoom": 1.6, "min_crop_h": 640}
@@ -370,6 +448,11 @@ def _parse_detections(raw: Iterable[dict]) -> list[Det]:
                 det.track_id = int(item["track_id"])
             except (TypeError, ValueError):
                 det.track_id = None
+        if item.get("ident") is not None:
+            try:
+                det.ident = float(item["ident"])
+            except (TypeError, ValueError):
+                det.ident = None
         dets.append(det)
     return assign_track_ids(dets)
 
@@ -703,8 +786,8 @@ def _subject_targets(
     and jumps (t, distance px) where it moved to a face track never seen before
     (a new shot: the caller snaps instead of panning when the jump is large).
 
-    Order of preference per sample: the diarized speaker's face, the main
-    track, the face nearest to the last target, the largest face. With no
+    Order of preference per sample: the campaign subject (T1b), the diarized
+    speaker's face, the main track, the face nearest to the last target, the largest face. With no
     face the window holds its last target (center before the first face).
     """
     main = main_track(samples)
@@ -718,7 +801,9 @@ def _subject_targets(
         seen |= fresh
         spk = speaker_at(sample.t, speakers)
         tid = mapping.get(spk) if spk else None
-        face = None
+        # T1b: the campaign subject first; without it in shot, whoever speaks.
+        subject = [f for f in sample.faces if f.subject]
+        face = max(subject, key=lambda f: (f.subject_score, f.area)) if subject else None
         for wanted in (tid, main):
             if face is None and wanted is not None:
                 face = next((f for f in sample.faces if f.track_id == wanted), None)
@@ -1173,9 +1258,12 @@ def _compile(
             return None
 
     centered = None
+    present = on_screen = None
     if "single" in paths:
         cw, ch = paths["single"]["crop"]
         centered = centered_ratio(followed, paths["single"]["origins"], times, cw, ch)
+        if cfg.get("subject"):
+            present, on_screen = subject_on_screen(samples, paths["single"]["origins"], times, cw, ch)
 
     ratio = None
     if "single" in paths:
@@ -1203,6 +1291,8 @@ def _compile(
         "subject_centered": None if centered is None else round(centered, 4),
         "subject_frames": len(followed),
         "cuts": [round(t, 3) for t in cuts],
+        "subject_present": present,
+        "subject_on_screen": on_screen,
     }
 
 
@@ -1505,12 +1595,18 @@ def _collect_scored(**kwargs) -> tuple[list[Sample], str, str | None, dict[str, 
     active: list[Det] = []
     next_id = 1
     mouth_prev: dict[int, Any] = {}
+    fid, refs = _open_subject(cfg, model_dir) if face_detector is not None else (None, [])
+    cfg["_subject_refs"] = len(refs)
+    last_id = -1e9
     try:
         for t, rgb, det_w, det_h in _iter_frames(
             kwargs["ffmpeg_bin"], kwargs["input_path"], kwargs["start"], kwargs["duration"],
-            cfg["sample_fps"], kwargs["src_w"], kwargs["src_h"],
+            cfg["sample_fps"], kwargs["src_w"], kwargs["src_h"], det_w=1280 if refs else 640,
         ):
             faces = _detect_faces(face_detector, rgb, det_w, det_h, kwargs["src_w"], kwargs["src_h"], t) if face_detector else []
+            if refs and faces and t - last_id >= SUBJECT_EVERY_S - 1e-6:
+                last_id = t
+                _identify(fid, refs, rgb, det_w, det_h, faces, kwargs["src_w"], kwargs["src_h"])
             objects = yolo.detect(rgb, det_w, det_h, kwargs["src_w"], kwargs["src_h"], t) if yolo else []
             used: set[int] = set()
             for det in faces:
@@ -1540,6 +1636,37 @@ def _collect_scored(**kwargs) -> tuple[list[Sample], str, str | None, dict[str, 
         if close:
             close()
     return samples, "+".join(names), None, gpu
+
+
+def _open_subject(cfg: dict[str, Any], model_dir: Path) -> tuple[Any, list[Any]]:
+    """Face-id models plus reference embeddings, or (None, []) when unavailable."""
+    subject = cfg.get("subject")
+    if not subject:
+        return None, []
+    from app.tools.face_id import open_face_id
+
+    fid = open_face_id(model_dir)
+    if fid is None:
+        return None, []
+    refs = fid.reference_features([Path(p) for p in subject["reference_paths"]])
+    return (fid, refs) if refs else (None, [])
+
+
+def _identify(fid, refs: list[Any], rgb: bytes, det_w: int, det_h: int, faces: list[Det],
+              src_w: int, src_h: int) -> None:
+    """Set ``ident`` on the MediaPipe faces that YuNet/SFace also see in this frame."""
+    import numpy as np
+
+    bgr = np.ascontiguousarray(np.frombuffer(rgb, np.uint8).reshape(det_h, det_w, 3)[:, :, ::-1])
+    sx, sy = src_w / det_w, src_h / det_h
+    for (x, y, w, h), feature in fid.faces(bgr):
+        cx, cy = (x + w / 2) * sx, (y + h / 2) * sy
+        hits = [f for f in faces if abs(f.x - cx) <= f.w * 0.6 and abs(f.y - cy) <= f.h * 0.6]
+        if not hits:
+            continue
+        face = min(hits, key=lambda f: (f.x - cx) ** 2 + (f.y - cy) ** 2)
+        sim = fid.similarity(feature, refs)
+        face.ident = sim if face.ident is None else max(face.ident, sim)
 
 
 def _base_meta(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -1614,6 +1741,17 @@ def plan_reframe(
         meta["layouts"] = [{"start": 0.0, "end": round(duration, 3), "layout": "single"}]
         return legacy
 
+    subject_cfg = cfg.get("subject")
+    if subject_cfg:
+        refs = cfg.get("_subject_refs")
+        meta["subject"] = {
+            "name": subject_cfg["name"],
+            "references": refs,
+            "tracks": label_subject_tracks(samples, subject_cfg["threshold"]),
+            "present": None,
+            "on_screen": None,
+            "error": "unavailable" if refs == 0 else None,
+        }
     compiled = _compile(
         samples, cfg, src_w=src_w, src_h=src_h, fmt=output_format,
         duration=duration, fps=output_fps or 30.0,
@@ -1634,6 +1772,9 @@ def plan_reframe(
     meta["subject_centered"] = compiled["subject_centered"]
     meta["subject_frames"] = compiled["subject_frames"]
     meta["cuts"] = compiled["cuts"]
+    if subject_cfg and compiled["subject_on_screen"] is not None:
+        meta["subject"]["present"] = round(compiled["subject_present"], 4)
+        meta["subject"]["on_screen"] = round(compiled["subject_on_screen"], 4)
     if compiled["crop"]:
         meta["crop"] = {"w": compiled["crop"][0], "h": compiled["crop"][1]}
 

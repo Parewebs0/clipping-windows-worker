@@ -121,3 +121,23 @@ def test_libass_pixels_stay_in_the_band(tmp_path, text):
     y1 = min(b[2] for b in boxes); y2 = max(b[3] for b in boxes)
     assert y1 >= H * SAFE_BAND[0] and y2 <= H * SAFE_BAND[1]
     assert x1 >= W * 0.12 and x2 <= W * 0.86
+
+
+def test_lines_break_at_sentence_end():
+    from app.tools.captions import _group_lines
+
+    items = [{"text": w, "start": i * 0.3, "end": i * 0.3 + 0.25} for i, w in enumerate("I swear. I never said that, okay? Okay, okay, so".split())]
+    lines = [" ".join(w["text"] for w in ln["words"]) for ln in _group_lines(items, max_words=3, duration=None)]
+    assert lines == ["I swear.", "I never said", "that, okay?", "Okay, okay,", "so"]
+    assert not any(re.search(r"[.?!]\s", ln) for ln in lines)  # no sentence end inside a line
+    assert all(len(ln.split()) <= 3 for ln in lines)
+
+
+def test_single_comma_word_does_not_force_a_one_word_line():
+    from app.tools.captions import _ends_clause
+
+    assert _ends_clause("Okay,", 1) is False
+    assert _ends_clause("okay,", 2) is True
+    assert _ends_clause("swear.", 1) is True
+    assert _ends_clause('said."', 1) is True
+    assert _ends_clause("3.5", 1) is False

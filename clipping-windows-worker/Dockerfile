@@ -25,6 +25,16 @@ RUN mkdir -p /opt/reframe-models \
  && echo "${FACE_MODEL_SHA256}  ${REFRAME_FACE_MODEL}" | sha256sum -c - \
  && python -c "from mediapipe.tasks.python.vision import FaceDetector; print('mediapipe ok')"
 
+# Face identity for the campaign subject (T1b): YuNet (MIT) aligns, SFace
+# (Apache-2.0) embeds. Both from opencv_zoo, run by opencv's FaceRecognizerSF.
+ARG ZOO=https://github.com/opencv/opencv_zoo/raw/main/models
+ARG YUNET_SHA256=8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
+ARG SFACE_SHA256=0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79
+ENV REFRAME_FACE_ID_DIR=/opt/reframe-models
+RUN python -c "import urllib.request as u; u.urlretrieve('${ZOO}/face_detection_yunet/face_detection_yunet_2023mar.onnx', '/opt/reframe-models/face_detection_yunet_2023mar.onnx'); u.urlretrieve('${ZOO}/face_recognition_sface/face_recognition_sface_2021dec.onnx', '/opt/reframe-models/face_recognition_sface_2021dec.onnx')" \
+ && printf '%s  %s\n%s  %s\n' "${YUNET_SHA256}" /opt/reframe-models/face_detection_yunet_2023mar.onnx "${SFACE_SHA256}" /opt/reframe-models/face_recognition_sface_2021dec.onnx | sha256sum -c - \
+ && python -c "import cv2; cv2.FaceRecognizerSF.create('/opt/reframe-models/face_recognition_sface_2021dec.onnx', ''); print('face id ok')"
+
 # gog CLI for Drive downloads; config/keyring are bind-mounted (see compose).
 ARG GOG_VERSION=0.40.0
 ARG GOG_SHA256_AMD64=5f73815950f30de4165b7b767103ca45c4950e84a1da601eda5294e9ff94f767
