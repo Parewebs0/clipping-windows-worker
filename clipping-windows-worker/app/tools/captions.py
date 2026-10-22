@@ -219,6 +219,15 @@ def _censor_config(style: dict[str, Any]) -> tuple[list[str], bool]:
     return [], False
 
 
+def caption_safe_band(style: dict[str, Any] | None) -> tuple[float, float] | None:
+    """Height band the captions must keep to, or None when the style has none.
+
+    Only the `shorts` preset is laid out for the TikTok/Reels UI (the VPS
+    verifier checks its 0.70-0.78 band); other presets are free to move.
+    """
+    return SAFE_BAND if resolve_caption_style(style)["name"] == "shorts" else None
+
+
 def resolve_caption_style(style: dict[str, Any] | None) -> dict[str, Any]:
     """Preset defaults, then explicit style keys. Unknown preset → classic."""
     src = style or {}

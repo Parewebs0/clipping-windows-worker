@@ -46,7 +46,7 @@ def logo_request(url: str, *, api_base_url: str, api_token: str) -> tuple[str, d
     if base and api_token and full.startswith(base + "/worker/"):
         headers["Authorization"] = f"Bearer {api_token}"
     return full, headers
-from app.tools.captions import caption_search_window, write_ass
+from app.tools.captions import caption_safe_band, caption_search_window, write_ass
 from app.tools.enhance import enhance_decision, parse_enhance, run_enhance
 from app.tools.ffmpeg import FFmpegTool
 from app.tools.ffprobe import FFprobeTool
@@ -405,6 +405,12 @@ class RenderJob(BaseJob):
         if zones and captions_file == ass_path:
             # Inset layout: captions under the webcam, on-screen texts above the
             # screen band, never over the face or the chart.
+            band = caption_safe_band((captions.get("style") if isinstance(captions.get("style"), dict) else None))
+            if band:
+                # The campaign's caption band (TikTok/Reels safe zone) wins over
+                # the inset caption zone: compliance checks it, so the captions
+                # keep their own style even if the band crosses the webcam.
+                zones = {**zones, "caption_band": list(band)}
             text_zones = zones
             self._text_zones = zones
             write_overlay(captions, on_screen_text, overlay_duration)
@@ -795,7 +801,7 @@ class RenderJob(BaseJob):
         style = ((payload.get("captions") or {}).get("style") or {})
         style = style if isinstance(style, dict) else {}
         zones = getattr(self, "_text_zones", None)
-        if zones:  # inset layout moved the captions under the webcam
+        if zones and not zones.get("caption_band"):  # inset layout moved the captions under the webcam
             style = {**style, "position": "top", "margin_v": int(zones["caption_margin_v"])}
         window = caption_search_window(vw, vh, style)
         segments = (payload.get("captions") or {}).get("segments") or []
@@ -1116,9 +1122,11 @@ def _sample_time(start, end, duration: float) -> float:
 
 
 def _fit_text_zones(caps: dict[str, Any], text: dict[str, Any], zones: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Captions anchored at the top of the caption zone, on-screen texts centred in the top zone."""
+    """Captions anchored at the top of the caption zone (unless the campaign has a
+    caption band), on-screen texts centred in the top zone."""
     caps = dict(caps)
-    caps["style"] = {**(caps.get("style") or {}), "position": "top", "margin_v": int(zones["caption_margin_v"])}
+    if not zones.get("caption_band"):  # a campaign caption band keeps the captions' own position
+        caps["style"] = {**(caps.get("style") or {}), "position": "top", "margin_v": int(zones["caption_margin_v"])}
     text = dict(text)
     text["style"] = {**(text.get("style") or {}), "margin_v": int(zones["overlay_margin_v"])}
     text["items"] = [{**it, "position": "top"} for it in (text.get("items") or [])]
