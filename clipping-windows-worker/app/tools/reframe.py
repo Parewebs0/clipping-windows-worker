@@ -2046,10 +2046,24 @@ def plan_reframe(
         return legacy
 
     if cfg["layout"] == "inset":
-        return _plan_inset(
+        plan = _plan_inset(
             cfg, meta, input_path=input_path, start=start, duration=duration, output_format=output_format,
             src_w=src_w, src_h=src_h, ffmpeg_bin=ffmpeg_bin, model_dir=model_dir or (work_dir / "models"),
         )
+        if not plan.legacy or cfg["mode"] == "center":
+            return plan
+        # No inset found: the campaign's own reframe (face / per-shot camera),
+        # not the historical centre crop.
+        single = plan_reframe(
+            input_path=input_path, start=start, end=end, output_format=output_format,
+            reframe={**(reframe or {}), "layout": "single", "inset": False}, src_w=src_w, src_h=src_h,
+            output_fps=output_fps, work_dir=work_dir, ffmpeg_bin=ffmpeg_bin, model_dir=model_dir,
+        )
+        single.metadata["inset"] = meta.get("inset")
+        single.metadata["inset_fallback"] = meta.get("fallback")
+        for key, value in (meta.get("timings") or {}).items():
+            single.metadata["timings"].setdefault(f"inset_{key}", value)
+        return single
 
     t0 = time.perf_counter()
     samples, detector, error, gpu = _collect_scored(

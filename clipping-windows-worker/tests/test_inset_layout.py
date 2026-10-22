@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -286,3 +287,46 @@ def test_overlay_margin_override():
     ass, _ = build_ass(width=1080, height=1920, captions=None, on_screen_text=ost, duration=4.0)
     overlay = next(line for line in ass.splitlines() if line.startswith("Style: Overlay"))
     assert overlay.split(",")[-2] == "77" and ",77,0,280)" in ass
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_no_inset_falls_back_to_the_campaign_reframe(tmp_path, monkeypatch):
+    monkeypatch.setattr(rf, "_inset_detector", lambda model_dir: MagicMock(return_value=[]))
+    src = _source(tmp_path)
+    dets = [{"t": i * 0.125, "x": 1400.0, "y": 500.0, "w": 200, "h": 260, "kind": "face", "track_id": 1}
+            for i in range(32)]
+    plan = plan_reframe(input_path=src, start=0.0, end=4.0, output_format="9:16",
+                        reframe={"mode": "face", "layout": "inset", "detections": dets},
+                        src_w=W, src_h=H, output_fps=30.0, work_dir=tmp_path)
+    meta = plan.metadata
+    # Face mode (static per-shot window on the presenter), not the centre crop.
+    assert plan.legacy is False and meta["layout"] == "single" and meta["mode"] == "face"
+    assert meta["inset_fallback"] == "no_inset" and meta["inset"]["probe"]["hits"] == 0
+    assert meta["camera"]["moves"] == 0 and "inset_probe_s" in meta["timings"]
+    xs = [int(v) for v in re.findall(r"crop x (\d+)", plan.command_files[0].read_text(encoding="ascii"))]
+    assert xs and min(xs) > (W - 608) / 2                    # window on the face (right), not centred
+    centre = plan_reframe(input_path=src, start=0.0, end=4.0, output_format="9:16",
+                          reframe={"mode": "center", "layout": "inset"},
+                          src_w=W, src_h=H, output_fps=30.0, work_dir=tmp_path / "c")
+    assert centre.legacy is True and centre.metadata["fallback"] == "no_inset"
+
+
+def test_caption_band_wins_over_the_inset_caption_zone():
+    from app.jobs.render import _fit_text_zones
+    from app.tools.captions import SAFE_BAND, build_ass, caption_safe_band
+    zones = {"top": [0, 262], "caption": [1596, 1920], "caption_margin_v": 1620, "overlay_margin_v": 86}
+    caps = {"enabled": True, "segments": [{"start": 0.2, "end": 3.0, "text": "you would sell most"}],
+            "style": {"preset": "shorts"}}
+    ost = {"enabled": True, "items": [{"text": "Sell", "start": 0, "end": 2, "position": "bottom"}]}
+    # No campaign band (classic): captions go under the webcam, as before.
+    plain = {**caps, "style": {"preset": "classic"}}
+    assert caption_safe_band(plain["style"]) is None
+    moved, _ = _fit_text_zones(plain, ost, zones)
+    assert moved["style"]["position"] == "top" and moved["style"]["margin_v"] == 1620
+    # Campaign band (shorts, 0.70-0.78): the captions keep it; the OST still goes to the top zone.
+    assert caption_safe_band(caps["style"]) == SAFE_BAND
+    kept, text = _fit_text_zones(caps, ost, {**zones, "caption_band": list(SAFE_BAND)})
+    assert kept["style"] == {"preset": "shorts"} and text["items"][0]["position"] == "top"
+    _ass, summary = build_ass(width=1080, height=1920, captions=kept, on_screen_text=text, duration=4.0)
+    zone = summary["captions"]["safe_zone"]
+    assert zone["in_band"] and zone["ui_overlap"] == []
