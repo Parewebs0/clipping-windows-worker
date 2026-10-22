@@ -253,6 +253,7 @@ def test_tiny_shift_cap_can_miss_the_speaker_and_still_bounds_the_step(tmp_path)
         layout="single",
         duration=duration,
         smoothing={"ema": 1.0, "deadzone_frac": 0.0, "max_shift_frac": 0.001},
+        camera="follow",  # the legacy tracker; the shot camera cuts instead
         detections=_two_faces(duration, switch),
         speakers=_speakers(duration, switch),
     )
