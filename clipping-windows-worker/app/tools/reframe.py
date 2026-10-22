@@ -120,6 +120,7 @@ class Camera:
     scene_threshold: float = 0.3
     min_shot_s: float = 0.5
     cut_frac: float = 0.5
+    pan_frac: float = 0.015  # peak eased-move speed per frame, fraction of the window width
 
     @property
     def as_dict(self) -> dict[str, Any]:
@@ -132,6 +133,7 @@ class Camera:
             "ease_s": self.ease_s,
             "scene_threshold": self.scene_threshold,
             "cut_frac": self.cut_frac,
+            "pan_frac": self.pan_frac,
         }
 
 
@@ -393,6 +395,7 @@ def _parse_camera(raw: Any) -> Camera:
         ease_s=num("ease_s", 0.8, 0.1, 5.0),
         scene_threshold=num("scene_threshold", 0.3, 0.05, 1.0),
         cut_frac=num("cut_frac", 0.5, 0.1, 5.0),
+        pan_frac=num("pan_frac", 0.015, 0.002, 0.5),
     )
 
 
@@ -864,8 +867,10 @@ def shot_origins(
             durations.append(0.0)
             continue
         dist = math.hypot(x1 - x0, y1 - y0)
-        # Peak speed of the cosine ease is pi/2 * dist / dur: keep it under the cap.
-        need = (math.pi / 2) * dist / max(1e-6, max_shift * fps) * 1.05
+        # Peak speed of the cosine ease is pi/2 * dist / dur: keep it under
+        # both the hard cap and the (gentler) pan speed.
+        peak = min(max_shift, camera.pan_frac * crop_w)
+        need = (math.pi / 2) * dist / max(1e-6, peak * fps) * 1.05
         durations.append(max(camera.ease_s, need))
         moves += 1
     for t in times:

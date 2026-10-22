@@ -62,11 +62,11 @@ def test_leaving_the_safe_zone_is_one_eased_move_capped_per_frame():
                                  camera=Camera(), max_shift=30.0)
     assert info["moves"] == 1 and info["snaps"] == []
     steps = _steps(origins)
-    assert max(steps) <= 30.0
+    assert max(steps) <= 0.015 * CROP_W + 1  # gentle pan: ~9 px/frame on a 606 px window
     # Accelerates and decelerates: no single-frame jump, no constant crawl.
     moving = [s for s in steps if s > 0]
     assert moving[0] < max(moving) and moving[-1] < max(moving)
-    assert len(moving) >= 0.8 * FPS * 0.8 - 2  # spread over ~ease_s
+    assert len(moving) >= 0.8 * FPS * 0.8 - 2  # spread over at least ease_s
     assert origins[0][0] == round(700 - CROP_W / 2) and origins[-1][0] == round(900 - CROP_W / 2)
 
 
