@@ -64,7 +64,7 @@ OUTPUT_SIZES: dict[str, tuple[int, int]] = {
 
 SCREEN_LABELS = {"tv", "laptop", "cell phone", "monitor"}
 MODES = {"center", "face", "object", "auto"}
-LAYOUTS = {"single", "split", "screenshare", "fit", "auto"}
+LAYOUTS = {"single", "split", "screenshare", "fit", "auto", "inset"}
 
 # Full-range BlazeFace (Apache-2.0 model card, MediaPipe). Faces in a wide
 # interview are often small; the short-range model misses them.
@@ -397,6 +397,24 @@ def _parse_camera(raw: Any) -> Camera:
         cut_frac=num("cut_frac", 0.5, 0.1, 5.0),
         pan_frac=num("pan_frac", 0.015, 0.002, 0.5),
     )
+
+
+def inset_for_campaign(reframe: dict | None, campaign_id: Any, campaigns: str | None) -> dict:
+    """``layout=inset`` for the campaigns listed in REFRAME_INSET_CAMPAIGNS.
+
+    Only when the payload did not choose a layout (absent, ``single`` or
+    ``auto``) and did not opt out with ``inset: false``. Returns a copy.
+    """
+    cfg = dict(reframe or {})
+    if cfg.get("inset") is True:
+        cfg["layout"] = "inset"
+        return cfg
+    if cfg.get("inset") is False or campaign_id is None:
+        return cfg
+    wanted = {part.strip() for part in str(campaigns or "").split(",") if part.strip()}
+    if str(campaign_id).strip() in wanted and str(cfg.get("layout") or "single").lower() in ("single", "auto"):
+        cfg["layout"] = "inset"
+    return cfg
 
 
 def needs_source_size(reframe: dict | None, output_format: str) -> bool:
@@ -2027,6 +2045,12 @@ def plan_reframe(
         meta["fallback"] = "no_source_size"
         return legacy
 
+    if cfg["layout"] == "inset":
+        return _plan_inset(
+            cfg, meta, input_path=input_path, start=start, duration=duration, output_format=output_format,
+            src_w=src_w, src_h=src_h, ffmpeg_bin=ffmpeg_bin, model_dir=model_dir or (work_dir / "models"),
+        )
+
     t0 = time.perf_counter()
     samples, detector, error, gpu = _collect_scored(
         input_path=input_path, start=start, duration=duration, cfg=cfg,
@@ -2096,3 +2120,100 @@ def plan_reframe(
         files.append(cmd_path)
     meta["legacy"] = False
     return ReframePlan(False, compiled["vf"], compiled["graph"], meta, files)
+
+
+def _inset_detector(model_dir: Path):
+    """Callable(rgb ndarray) -> faces (Det, centre coords in that image), or None."""
+    detector = _open_face_detector(model_dir)
+    if detector is None:
+        return None
+
+    def detect(img) -> list[Det]:
+        h, w = img.shape[:2]
+        return _detect_faces(detector, img.tobytes(), w, h, w, h, 0.0)
+
+    detect.close = getattr(detector, "close", None)  # type: ignore[attr-defined]
+    return detect
+
+
+def _plan_inset(
+    cfg: dict[str, Any],
+    meta: dict[str, Any],
+    *,
+    input_path: Path,
+    start: float,
+    duration: float,
+    output_format: str,
+    src_w: int,
+    src_h: int,
+    ffmpeg_bin: str,
+    model_dir: Path,
+) -> ReframePlan:
+    """``layout=inset``: screen on top + webcam window below, per shot; centre crop otherwise.
+
+    Static per shot. Shots where the webcam window is not found with enough
+    agreement keep the historical centre crop (never a moving one).
+    """
+    from app.tools import inset_layout as il
+
+    legacy = ReframePlan(True, None, None, meta, [])
+    meta["layouts"] = [{"start": 0.0, "end": round(duration, 3), "layout": "single"}]
+    if output_format != "9:16":
+        meta["legacy"] = True
+        meta["fallback"] = "inset_needs_9_16"
+        return legacy
+    t0 = time.perf_counter()
+    if "scene_cuts" in cfg:
+        cuts = [c for c in cfg["scene_cuts"] if 0 < c < duration]
+    else:
+        cuts = detect_scene_cuts(ffmpeg_bin, input_path, start, duration, threshold=cfg["camera"].scene_threshold)
+    meta["timings"]["scene_cuts_s"] = round(time.perf_counter() - t0, 3)
+    bounds = [0.0] + cuts + [duration]
+    shots = [(a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
+    detect = _inset_detector(model_dir)
+    if detect is None:
+        meta["legacy"] = True
+        meta["fallback"] = "detector_unavailable"
+        return legacy
+    t1 = time.perf_counter()
+    try:
+        times = il.sample_times(shots)
+        frames = [[il.grab_frame(ffmpeg_bin, input_path, start + t, src_w, src_h) for t in ts] for ts in times]
+        sample_w = next((f.shape[1] for fs in frames for f in fs if f is not None), src_w)
+        result = il.classify_shots(shots, frames, detect, scale=src_w / sample_w, frame_w=src_w)
+    except Exception as exc:  # noqa: BLE001 — a failed detection keeps the centre crop
+        logger.warning("inset detection failed", error=str(exc))
+        meta["legacy"] = True
+        meta["fallback"] = "inset_error"
+        return legacy
+    finally:
+        close = getattr(detect, "close", None)
+        if close:
+            close()
+    meta["timings"]["detect_s"] = round(time.perf_counter() - t1, 3)
+    window = il.clip_window(result, src_w)
+    sampled = [s for s in result if not s["short"]]
+    meta["detector"] = "mediapipe-corners+edges"
+    meta["frames_sampled"] = sum(s["samples"] for s in result)
+    meta["inset"] = {
+        "shots": [{"start": s["start"], "end": s["end"], "inset": bool(s["inset"]),
+                   "samples": s["samples"], "found": s["found"], "short": s["short"]} for s in result],
+        "detected_shots": sum(1 for s in sampled if s["inset"] is not None),
+        "sampled_shots": len(sampled),
+        "detected_s": round(sum(s["end"] - s["start"] for s in result if s["inset"] is not None), 3),
+        "window": window.as_list() if window else None,
+        "scene_cuts": [round(c, 3) for c in cuts],
+    }
+    if window is None:
+        meta["legacy"] = True
+        meta["fallback"] = "no_inset"
+        return legacy
+    for shot in result:
+        if shot["inset"] is not None:
+            shot["inset"] = window  # one rectangle for the clip: the layout never shifts between shots
+    spans = il.spans_from(result)
+    geo = il.geometry(src_w, src_h, window, *output_size(output_format))
+    meta["inset"]["geometry"] = geo
+    meta["layouts"] = spans
+    meta["legacy"] = False
+    return ReframePlan(False, None, il.build_graph(spans, geo, src_w, src_h), meta, [])

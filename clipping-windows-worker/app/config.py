@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     storage_root: Path | None = None
     # Cleanup of storage_root driven by POST /worker/storage/check (server says
     # what is decided / archived / idle). Off by default; dry-run by default.
+    # Campaign ids (comma separated, e.g. "58") whose renders use the
+    # screen-on-top + webcam-below layout (reframe layout=inset) when the
+    # payload does not pick a layout itself. Empty = off everywhere. A payload
+    # can also ask for it with reframe.layout="inset", or opt out with
+    # reframe.inset=false.
+    reframe_inset_campaigns: str = ""
     storage_cleanup_enabled: bool = False
     storage_cleanup_dry_run: bool = True
     storage_cleanup_interval: float = Field(default=1800.0, ge=60.0)
