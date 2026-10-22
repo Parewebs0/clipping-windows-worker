@@ -209,9 +209,12 @@ class RenderJob(BaseJob):
 
         captions_file = None
         ass_path = self.directory.output / "overlay.ass"
+        text_zones: dict[str, Any] | None = None  # set by the inset layout: fixed caption/OST positions
 
         def write_overlay(caps: dict[str, Any], text: dict[str, Any], span: float) -> None:
             nonlocal captions_file
+            if text_zones:
+                caps, text = _fit_text_zones(caps, text, text_zones)
             wants_generated = (caps.get("enabled") and caps.get("segments")) or text.get("enabled")
             if caps.get("enabled") and caps.get("file") and not caps.get("segments"):
                 captions_file = self._resolve_input(caps["file"])
@@ -398,6 +401,14 @@ class RenderJob(BaseJob):
         plan.metadata.setdefault("timings", {})
         plan.metadata["timings"]["plan_s"] = round(time.perf_counter() - t_plan, 3)
         applied["reframe"] = plan.metadata
+        zones = (plan.metadata.get("inset") or {}).get("text_zones") if not plan.legacy else None
+        if zones and captions_file == ass_path:
+            # Inset layout: captions under the webcam, on-screen texts above the
+            # screen band, never over the face or the chart.
+            text_zones = zones
+            self._text_zones = zones
+            write_overlay(captions, on_screen_text, overlay_duration)
+            applied["reframe"]["inset"]["text_zones"] = {**zones, "applied": True}
 
         from app.tools.production import features_requested, prepare_production
 
@@ -782,7 +793,11 @@ class RenderJob(BaseJob):
         """
         vw, vh = probe_size
         style = ((payload.get("captions") or {}).get("style") or {})
-        window = caption_search_window(vw, vh, style if isinstance(style, dict) else {})
+        style = style if isinstance(style, dict) else {}
+        zones = getattr(self, "_text_zones", None)
+        if zones:  # inset layout moved the captions under the webcam
+            style = {**style, "position": "top", "margin_v": int(zones["caption_margin_v"])}
+        window = caption_search_window(vw, vh, style)
         segments = (payload.get("captions") or {}).get("segments") or []
         times = caption_sample_times(segments, duration)
         if not times:
@@ -1098,3 +1113,13 @@ def _sample_time(start, end, duration: float) -> float:
     mid = (s + e) / 2.0
     hi = max(0.05, duration - 0.05)
     return min(max(mid, 0.05), hi)
+
+
+def _fit_text_zones(caps: dict[str, Any], text: dict[str, Any], zones: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Captions anchored at the top of the caption zone, on-screen texts centred in the top zone."""
+    caps = dict(caps)
+    caps["style"] = {**(caps.get("style") or {}), "position": "top", "margin_v": int(zones["caption_margin_v"])}
+    text = dict(text)
+    text["style"] = {**(text.get("style") or {}), "margin_v": int(zones["overlay_margin_v"])}
+    text["items"] = [{**it, "position": "top"} for it in (text.get("items") or [])]
+    return caps, text

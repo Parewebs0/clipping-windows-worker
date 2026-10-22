@@ -2162,25 +2162,60 @@ def _plan_inset(
         meta["legacy"] = True
         meta["fallback"] = "inset_needs_9_16"
         return legacy
-    t0 = time.perf_counter()
-    if "scene_cuts" in cfg:
-        cuts = [c for c in cfg["scene_cuts"] if 0 < c < duration]
-    else:
-        cuts = detect_scene_cuts(ffmpeg_bin, input_path, start, duration, threshold=cfg["camera"].scene_threshold)
-    meta["timings"]["scene_cuts_s"] = round(time.perf_counter() - t0, 3)
-    bounds = [0.0] + cuts + [duration]
-    shots = [(a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
     detect = _inset_detector(model_dir)
     if detect is None:
         meta["legacy"] = True
         meta["fallback"] = "detector_unavailable"
         return legacy
-    t1 = time.perf_counter()
     try:
+        # Quick probe: no webcam window in any of a few frames -> centre crop
+        # without the scene-cut pass and the per-shot sampling. Trade-off: a
+        # window shown only briefly between the probes is missed.
+        tp = time.perf_counter()
+        probe_t = il.probe_times(duration)
+        probe_hits = 0
+        for t in probe_t:
+            img = il.grab_frame(ffmpeg_bin, input_path, start + t, src_w, src_h)
+            if img is not None and il.find_window(detect, img)[0] is not None:
+                probe_hits += 1
+        meta["timings"]["probe_s"] = round(time.perf_counter() - tp, 3)
+        meta["inset"] = {"probe": {"times": probe_t, "hits": probe_hits}}
+        if probe_hits == 0:
+            meta["legacy"] = True
+            meta["fallback"] = "no_inset"
+            return legacy
+        t0 = time.perf_counter()
+        if "scene_cuts" in cfg:
+            cuts = [c for c in cfg["scene_cuts"] if 0 < c < duration]
+        else:
+            cuts = detect_scene_cuts(ffmpeg_bin, input_path, start, duration, threshold=cfg["camera"].scene_threshold)
+        meta["timings"]["scene_cuts_s"] = round(time.perf_counter() - t0, 3)
+        bounds = [0.0] + cuts + [duration]
+        shots = [(a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
+        t1 = time.perf_counter()
         times = il.sample_times(shots)
         frames = [[il.grab_frame(ffmpeg_bin, input_path, start + t, src_w, src_h) for t in ts] for ts in times]
         sample_w = next((f.shape[1] for fs in frames for f in fs if f is not None), src_w)
-        result = il.classify_shots(shots, frames, detect, scale=src_w / sample_w, frame_w=src_w)
+        scale = src_w / sample_w
+        result = il.classify_shots(shots, frames, detect, scale=scale, frame_w=src_w)
+        meta["timings"]["detect_s"] = round(time.perf_counter() - t1, 3)
+        window = il.clip_window(result, src_w)
+        band = mask = None
+        fill, how = "000000", "none"
+        if window is not None:
+            # Useful screen area from the frames of the shots with the window.
+            t2 = time.perf_counter()
+            inset_frames = [f for s, fs in zip(result, frames) if s["inset"] is not None for f in fs if f is not None]
+            local = window.scaled(1 / scale)
+            box = il.content_box(inset_frames[:12], exclude=local)
+            band_local = box or il.Box(0.0, 0.0, float(sample_w), float(inset_frames[0].shape[0]))
+            band_local, mask_local, how = il.band_and_mask(band_local, local, sample_w)
+            if mask_local is not None:
+                fill = il.fill_colour(inset_frames, band_local, local)
+                mask = mask_local.scaled(scale)
+            band = band_local.scaled(scale) if (box is not None or how != "none") else None
+            meta["timings"]["content_s"] = round(time.perf_counter() - t2, 3)
+            meta["content_box"] = box.scaled(scale).as_list() if box else None
     except Exception as exc:  # noqa: BLE001 — a failed detection keeps the centre crop
         logger.warning("inset detection failed", error=str(exc))
         meta["legacy"] = True
@@ -2190,12 +2225,11 @@ def _plan_inset(
         close = getattr(detect, "close", None)
         if close:
             close()
-    meta["timings"]["detect_s"] = round(time.perf_counter() - t1, 3)
-    window = il.clip_window(result, src_w)
     sampled = [s for s in result if not s["short"]]
     meta["detector"] = "mediapipe-corners+edges"
-    meta["frames_sampled"] = sum(s["samples"] for s in result)
-    meta["inset"] = {
+    meta["frames_sampled"] = sum(s["samples"] for s in result) + len(probe_t)
+    content_box = meta.pop("content_box", None)
+    meta["inset"].update({
         "shots": [{"start": s["start"], "end": s["end"], "inset": bool(s["inset"]),
                    "samples": s["samples"], "found": s["found"], "short": s["short"]} for s in result],
         "detected_shots": sum(1 for s in sampled if s["inset"] is not None),
@@ -2203,17 +2237,23 @@ def _plan_inset(
         "detected_s": round(sum(s["end"] - s["start"] for s in result if s["inset"] is not None), 3),
         "window": window.as_list() if window else None,
         "scene_cuts": [round(c, 3) for c in cuts],
-    }
+    })
     if window is None:
         meta["legacy"] = True
         meta["fallback"] = "no_inset"
         return legacy
+    faces = [s["face"] for s in result if s["inset"] is not None and s.get("face") is not None]
+    face = faces[len(faces) // 2] if faces else None
     for shot in result:
         if shot["inset"] is not None:
             shot["inset"] = window  # one rectangle for the clip: the layout never shifts between shots
     spans = il.spans_from(result)
-    geo = il.geometry(src_w, src_h, window, *output_size(output_format))
+    geo = il.geometry(src_w, src_h, window, *output_size(output_format), band=band, face=face, mask=mask, fill=fill)
+    meta["inset"]["content_box"] = content_box
+    meta["inset"]["thumbnail"] = how
+    meta["inset"]["face"] = face.as_list() if face else None
     meta["inset"]["geometry"] = geo
+    meta["inset"]["text_zones"] = geo["text_zones"]
     meta["layouts"] = spans
     meta["legacy"] = False
     return ReframePlan(False, None, il.build_graph(spans, geo, src_w, src_h), meta, [])
