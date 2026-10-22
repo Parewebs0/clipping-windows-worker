@@ -19,6 +19,14 @@ Layouts (used when mode is face, object or auto, or when layout is forced):
 
 ``layout=auto`` holds a choice for ``hold_s`` (default 0.75 s) before switching.
 
+Camera (P0, 2026-10-22): by default (``camera=shot``) every window is fixed
+per shot: it sits on the median of the subject, ignores moves smaller than the
+safe zone (15 % of the window width, 10 % of its height), re-frames with one
+eased move only when the subject stays out of it for 0.5 s, and cuts (never
+pans) at scene cuts found by FFmpeg's scene score. ``camera=follow`` restores
+the EMA tracker described above, which re-aimed every frame and made the
+window bob with every head movement.
+
 Face mode (T1, 2026-10-21):
 
 - the window follows one main person: the diarized speaker when known, else
@@ -88,6 +96,44 @@ class Smoothing:
             "ema": self.ema,
             "deadzone_frac": self.deadzone_frac,
             "max_shift_frac": self.max_shift_frac,
+        }
+
+
+@dataclass
+class Camera:
+    """P0 (2026-10-22): how the window moves inside a shot.
+
+    ``shot`` (default): a fixed window per shot. The anchor is the median of the
+    subject's position; it only moves when the subject's rolling median leaves
+    the safe zone (``safe_frac_x`` of the window width, ``safe_frac_y`` of its
+    height) for ``confirm_s``, and then with one eased move (no per-frame
+    tracking, so no jitter). A scene cut is a clean cut to the new shot's anchor.
+    ``follow``: the previous EMA + dead zone tracker (kept for rollback).
+    """
+
+    mode: str = "shot"
+    safe_frac_x: float = 0.15
+    safe_frac_y: float = 0.10
+    window_s: float = 1.0
+    confirm_s: float = 0.5
+    ease_s: float = 0.8
+    scene_threshold: float = 0.3
+    min_shot_s: float = 0.5
+    cut_frac: float = 0.5
+    pan_frac: float = 0.015  # peak eased-move speed per frame, fraction of the window width
+
+    @property
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "safe_frac_x": self.safe_frac_x,
+            "safe_frac_y": self.safe_frac_y,
+            "window_s": self.window_s,
+            "confirm_s": self.confirm_s,
+            "ease_s": self.ease_s,
+            "scene_threshold": self.scene_threshold,
+            "cut_frac": self.cut_frac,
+            "pan_frac": self.pan_frac,
         }
 
 
@@ -195,7 +241,16 @@ def normalize_reframe(raw: dict | None) -> dict[str, Any]:
         "hold_s": hold_s,
         "speakers": speakers,
         "zoom": _parse_zoom(src.get("zoom"), default_on=mode == "face"),
+        "camera": _parse_camera(src.get("camera")),
     }
+    if "scene_cuts" in src:
+        cuts = []
+        for value in src.get("scene_cuts") or []:
+            try:
+                cuts.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        out["scene_cuts"] = sorted(cuts)
     subject = _parse_subject(src.get("subject"))
     if subject:
         out["subject"] = subject
@@ -312,6 +367,35 @@ def _parse_smoothing(raw: Any) -> Smoothing:
         ema=num("ema", 0.45, 0.05, 1.0),
         deadzone_frac=num("deadzone_frac", 0.03, 0.0, 0.25),
         max_shift_frac=num("max_shift_frac", 0.05, 0.001, 0.5),
+    )
+
+
+def _parse_camera(raw: Any) -> Camera:
+    """``camera: "shot"|"follow"|{mode, safe_frac_x, safe_frac_y, window_s, confirm_s, ease_s, scene_threshold}``."""
+    if isinstance(raw, str):
+        raw = {"mode": raw}
+    if not isinstance(raw, dict):
+        return Camera()
+    mode = str(raw.get("mode") or "shot").strip().lower()
+    if mode not in ("shot", "follow"):
+        mode = "shot"
+
+    def num(key: str, default: float, lo: float, hi: float) -> float:
+        try:
+            return _clamp(float(raw.get(key, default)), lo, hi)
+        except (TypeError, ValueError):
+            return default
+
+    return Camera(
+        mode=mode,
+        safe_frac_x=num("safe_frac_x", 0.15, 0.0, 0.5),
+        safe_frac_y=num("safe_frac_y", 0.10, 0.0, 0.5),
+        window_s=num("window_s", 1.0, 0.1, 5.0),
+        confirm_s=num("confirm_s", 0.5, 0.0, 5.0),
+        ease_s=num("ease_s", 0.8, 0.1, 5.0),
+        scene_threshold=num("scene_threshold", 0.3, 0.05, 1.0),
+        cut_frac=num("cut_frac", 0.5, 0.1, 5.0),
+        pan_frac=num("pan_frac", 0.015, 0.002, 0.5),
     )
 
 
@@ -648,6 +732,200 @@ def cut_indices(times: list[float], cuts: Iterable[float]) -> list[int]:
         if index:
             out.append(index)
     return out
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    return ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _ease(u: float) -> float:
+    """Cosine ease-in-out, 0 -> 1. Peak speed is pi/2 x the mean speed."""
+    u = _clamp(u, 0.0, 1.0)
+    return 0.5 - 0.5 * math.cos(math.pi * u)
+
+
+def plan_holds(
+    points: list[tuple[float, float, float]],
+    *,
+    start: float,
+    end: float,
+    safe_x: float,
+    safe_y: float,
+    camera: Camera,
+) -> list[tuple[float, float, float]]:
+    """Holds ``(t_start, cx, cy)`` for one shot from the subject's positions in it.
+
+    The window stays put while the rolling median of the subject (``window_s``)
+    is within the safe zone of the anchor; once it has been outside for
+    ``confirm_s`` a new hold starts there. Each hold's anchor is then the
+    median of the subject over the hold, and holds closer than half the safe
+    zone are merged, so small moves never produce a camera move.
+    """
+    pts = sorted(p for p in points if start - 1e-6 <= p[0] < end - 1e-6)
+    if not pts:
+        return []
+    starts = [start]
+    out_since: float | None = None
+    lo = 0      # rolling window start
+    hold = 0    # first point of the current hold
+    for i, (t, _x, _y) in enumerate(pts):
+        while pts[lo][0] < t - camera.window_s:
+            lo += 1
+        win = pts[lo:i + 1]
+        mx, my = _median([p[1] for p in win]), _median([p[2] for p in win])
+        # Anchor = median of the hold before the rolling window (where the
+        # person has been sitting), so a steady sway never reads as "left the
+        # zone" and a real move is not absorbed by the anchor itself.
+        hist = pts[hold:lo] if lo > hold else pts[hold:i + 1]
+        ax = _median([p[1] for p in hist])
+        ay = _median([p[2] for p in hist])
+        if abs(mx - ax) > safe_x or abs(my - ay) > safe_y:
+            out_since = t if out_since is None else out_since
+            if t - out_since >= camera.confirm_s - 1e-6:
+                # The rolling median flips about half a window after the
+                # person moved: the hold starts there (we plan offline, so the
+                # move need not wait for the confirmation).
+                starts.append(max(starts[-1] + 1e-3, out_since - camera.window_s / 2, start))
+                out_since = None
+                lo = hold = i  # the new hold judges only what comes after it
+        else:
+            out_since = None
+    holds: list[tuple[float, float, float]] = []
+    bounds = starts + [end]
+    for left, right in zip(bounds, bounds[1:]):
+        inside = [p for p in pts if left - 1e-6 <= p[0] < right - 1e-6]
+        if not inside:
+            continue
+        cx, cy = _median([p[1] for p in inside]), _median([p[2] for p in inside])
+        if holds and abs(cx - holds[-1][1]) <= safe_x / 2 and abs(cy - holds[-1][2]) <= safe_y / 2:
+            continue
+        holds.append((round(left, 3) if holds else start, cx, cy))
+    return holds
+
+
+def shot_origins(
+    points: list[tuple[float, float, float]],
+    times: list[float],
+    *,
+    crop_w: int,
+    crop_h: int,
+    src_w: int,
+    src_h: int,
+    camera: Camera,
+    max_shift: float,
+    cuts: Iterable[float] = (),
+    fallback: tuple[float, float] | None = None,
+) -> tuple[list[tuple[int, int]], dict[str, Any]]:
+    """Integer crop origins at ``times`` with a fixed window per shot.
+
+    ``points`` are the subject's (t, x, y) where it was really seen. ``cuts``
+    split the clip into shots: at a cut the window cuts (never pans) to the
+    new shot, and keeps its place when the new anchor is inside the safe zone
+    of the old one (a false cut is invisible). A shot without the subject
+    holds a centred window. Inside a shot the window only moves between holds,
+    with a cosine ease long enough that no frame moves more than ``max_shift``.
+    """
+    if not times:
+        times = [0.0]
+    end = times[-1] + (times[1] - times[0] if len(times) > 1 else 1 / 30)
+    fps = 1.0 / (times[1] - times[0]) if len(times) > 1 and times[1] > times[0] else 30.0
+    safe_x = camera.safe_frac_x * crop_w
+    safe_y = camera.safe_frac_y * crop_h
+    center = fallback or _center_of(src_w, src_h)
+    shot_starts = [0.0]
+    for cut in sorted(c for c in cuts if 0.0 < c < end):
+        if cut - shot_starts[-1] >= camera.min_shot_s - 1e-6:
+            shot_starts.append(cut)
+    bounds = shot_starts + [end]
+
+    # (t_start, cx, cy, snap): snap=True is a cut, else an eased move.
+    keys: list[tuple[float, float, float, bool]] = []
+    for left, right in zip(bounds, bounds[1:]):
+        holds = plan_holds(points, start=left, end=right, safe_x=safe_x, safe_y=safe_y, camera=camera)
+        if not holds:
+            holds = [(left, *center)]
+        for index, (t, cx, cy) in enumerate(holds):
+            cx, cy = _clamp_center(cx, cy, crop_w, crop_h, src_w, src_h)
+            if keys and abs(cx - keys[-1][1]) <= safe_x and abs(cy - keys[-1][2]) <= safe_y and index == 0:
+                continue  # same framing across the cut: do not move at all
+            # A re-frame further than half the window (speaker switch, someone
+            # crossing the room) is cut, not panned: a long pan reads as a swing.
+            far = bool(keys) and math.hypot(cx - keys[-1][1], cy - keys[-1][2]) > camera.cut_frac * crop_w
+            keys.append((t, cx, cy, index == 0 or far))
+
+    origins: list[tuple[int, int]] = []
+    k = 0
+    moves = 0
+    durations: list[float] = []
+    for key_index in range(1, len(keys)):
+        t0, x0, y0, _ = keys[key_index - 1]
+        t1, x1, y1, snap = keys[key_index]
+        if snap:
+            durations.append(0.0)
+            continue
+        dist = math.hypot(x1 - x0, y1 - y0)
+        # Peak speed of the cosine ease is pi/2 * dist / dur: keep it under
+        # both the hard cap and the (gentler) pan speed.
+        peak = min(max_shift, camera.pan_frac * crop_w)
+        need = (math.pi / 2) * dist / max(1e-6, peak * fps) * 1.05
+        durations.append(max(camera.ease_s, need))
+        moves += 1
+    for t in times:
+        while k + 1 < len(keys) and t >= keys[k + 1][0] - 1e-6:
+            k += 1
+        _t, cx, cy, _snap = keys[k]
+        if k > 0 and not keys[k][3]:
+            dur = durations[k - 1]
+            u = (t - keys[k][0]) / dur if dur > 0 else 1.0
+            if u < 1.0:
+                px, py = keys[k - 1][1], keys[k - 1][2]
+                e = _ease(u)
+                cx, cy = px + (cx - px) * e, py + (cy - py) * e
+        origins.append(_origin(cx, cy, crop_w, crop_h, src_w, src_h))
+    snaps = set(cut_indices(times, [key[0] for key in keys[1:] if key[3]]))
+    for i in range(1, len(origins)):
+        if i not in snaps:
+            origins[i] = _limit_step(origins[i - 1], origins[i][0], origins[i][1], max_shift)
+    info = {
+        "shots": len(bounds) - 1,
+        "holds": len(keys),
+        "moves": moves,
+        "snaps": [round(key[0], 3) for key in keys[1:] if key[3]],
+    }
+    return origins, info
+
+
+def detect_scene_cuts(ffmpeg_bin: str, path: Path, start: float, duration: float,
+                      threshold: float = 0.3, min_gap: float = 0.5) -> list[float]:
+    """Hard cuts in the clip (seconds from its start), from FFmpeg's scene score.
+
+    Full frame rate on a 320 px copy, so a cut lands on its exact frame (the
+    8 fps face samples would put it up to 0.12 s late). Returns [] on error.
+    """
+    cmd = [
+        ffmpeg_bin, "-v", "error", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(path),
+        "-an", "-vf", f"scale=320:-2,select='gt(scene\\,{threshold:.3f})',metadata=print:file=-",
+        "-f", "null", "-",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(60.0, duration * 4))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("scene cut detection failed", error=str(exc))
+        return []
+    cuts: list[float] = []
+    for line in proc.stdout.splitlines():
+        if "pts_time:" not in line:
+            continue
+        try:
+            t = float(line.split("pts_time:")[1].split()[0])
+        except (IndexError, ValueError):
+            continue
+        if 0.0 < t < duration and (not cuts or t - cuts[-1] >= min_gap):
+            cuts.append(round(t, 3))
+    return cuts
 
 
 def _max_step(origins: list[tuple[int, int]], skip: Iterable[int] = ()) -> float:
@@ -1167,6 +1445,8 @@ def _compile(
 ) -> dict[str, Any] | None:
     """Return graph inputs, or None when the result is the legacy center crop."""
     smoothing: Smoothing = cfg["smoothing"]
+    camera: Camera = cfg.get("camera") or Camera()
+    scene_cuts: list[float] = list(cfg.get("scene_cuts") or [])
     speakers: list[dict] = cfg["speakers"]
     mapping = map_speakers(samples, speakers)
     two_speakers = len({str(seg["speaker"]) for seg in speakers}) >= 2 and any(
@@ -1209,11 +1489,13 @@ def _compile(
     zoom = 1.0
     followed: list[tuple[float, float, float, float]] = []
     cuts: list[float] = []
+    camera_info: dict[str, Any] = {}
     for layout in used:
         for name, slot_w, slot_h in _slot_sizes(fmt, layout):
             if name == "fit":
                 continue
             cw, ch = _crop_for_slot(src_w, src_h, slot_w, slot_h)
+            points: list[tuple[float, float, float]] | None = None
             if name == "single":
                 targets, followed, jumps = _subject_targets(
                     samples, speakers=speakers, mapping=mapping, src_w=src_w, src_h=src_h,
@@ -1225,18 +1507,37 @@ def _compile(
                 if cfg["mode"] == "face":
                     # Eyes a bit above the middle: the face sits at ~40% of the window height.
                     targets = [(t, x, y + ch * 0.10) for t, x, y in targets]
+                    points = [(t, x, y + ch * 0.10) for t, x, y, _h in followed]
                     # New shot far away: jump there instead of panning across.
-                    cuts = [t for t, dist in jumps if dist > 0.5 * cw]
+                    # With real scene cuts (shot camera on a real source) those
+                    # are the cuts: a face track that breaks inside a shot is not
+                    # one, and the holds re-frame (or cut) if the person moved.
+                    cuts = [] if camera.mode == "shot" and "scene_cuts" in cfg else [
+                        t for t, dist in jumps if dist > 0.5 * cw]
             else:
                 targets = _targets_for(
                     name, samples, layout=layout, speakers=speakers, mapping=mapping,
                     src_w=src_w, src_h=src_h, screen_box=screen,
                 )
             slot_cuts = cuts if name == "single" else []
-            origins, cap = smooth_origins(
-                targets, times, crop_w=cw, crop_h=ch, src_w=src_w, src_h=src_h, smoothing=smoothing,
-                cuts=slot_cuts,
-            )
+            if camera.mode == "shot":
+                cap = smoothing.max_shift_frac * float(min(cw, ch))
+                all_cuts = sorted(set(slot_cuts) | set(scene_cuts))
+                origins, info = shot_origins(
+                    points if points is not None else targets, times, crop_w=cw, crop_h=ch,
+                    src_w=src_w, src_h=src_h, camera=camera, max_shift=cap, cuts=all_cuts,
+                    fallback=_static_centers(layout, src_w, src_h).get(name),
+                )
+                slot_cuts = info["snaps"]
+                if name in ("single", "face"):
+                    camera_info = info
+                    if name == "single":
+                        cuts = list(slot_cuts)
+            else:
+                origins, cap = smooth_origins(
+                    targets, times, crop_w=cw, crop_h=ch, src_w=src_w, src_h=src_h, smoothing=smoothing,
+                    cuts=slot_cuts,
+                )
             paths[name] = {
                 "layout": layout,
                 "crop": (cw, ch),
@@ -1249,7 +1550,7 @@ def _compile(
                 observed = max(observed, _max_step(origins, cut_indices(times, slot_cuts)))
             elif layout == "split":
                 max_shift = max(max_shift, cap)
-                observed = max(observed, _max_step(origins))
+                observed = max(observed, _max_step(origins, cut_indices(times, slot_cuts)))
 
     # A single window that never leaves the center is the historical crop.
     if used == ["single"] and "single" in paths and fmt in ("9:16", "16:9") and zoom == 1.0:
@@ -1293,6 +1594,7 @@ def _compile(
         "cuts": [round(t, 3) for t in cuts],
         "subject_present": present,
         "subject_on_screen": on_screen,
+        "camera": dict(camera.as_dict, scene_cuts=[round(t, 3) for t in scene_cuts], **camera_info),
     }
 
 
@@ -1674,6 +1976,7 @@ def _base_meta(cfg: dict[str, Any]) -> dict[str, Any]:
         "mode": cfg["mode"],
         "layout": cfg["layout"],
         "smoothing": cfg["smoothing"].as_dict,
+        "camera": cfg["camera"].as_dict,
         "sample_fps": cfg["sample_fps"],
         "legacy": False,
         "fallback": None,
@@ -1731,6 +2034,12 @@ def plan_reframe(
         model_dir=model_dir or (work_dir / "models"),
     )
     meta["timings"]["detect_s"] = round(time.perf_counter() - t0, 3)
+    if cfg["camera"].mode == "shot" and "scene_cuts" not in cfg and "detections" not in cfg and not error:
+        t1 = time.perf_counter()
+        cfg["scene_cuts"] = detect_scene_cuts(
+            ffmpeg_bin, input_path, start, duration, threshold=cfg["camera"].scene_threshold,
+        )
+        meta["timings"]["scene_cuts_s"] = round(time.perf_counter() - t1, 3)
     meta["detector"] = detector
     meta["gpu"] = gpu
     meta["frames_sampled"] = len(samples)
@@ -1772,6 +2081,7 @@ def plan_reframe(
     meta["subject_centered"] = compiled["subject_centered"]
     meta["subject_frames"] = compiled["subject_frames"]
     meta["cuts"] = compiled["cuts"]
+    meta["camera"] = compiled["camera"]
     if subject_cfg and compiled["subject_on_screen"] is not None:
         meta["subject"]["present"] = round(compiled["subject_present"], 4)
         meta["subject"]["on_screen"] = round(compiled["subject_on_screen"], 4)

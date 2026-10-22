@@ -124,10 +124,17 @@ def test_new_shot_snaps_instead_of_panning(tmp_path):
     assert meta["subject_centered"] >= 0.95
 
 
-def test_speaker_switch_between_faces_in_shot_still_pans(tmp_path):
+def test_speaker_switch_between_faces_in_shot_cuts_without_a_scene_jump(tmp_path):
     both = _track(1, x=480, y=540, h=260, duration=6.0) + _track(2, x=1440, y=540, h=260, duration=6.0)
     speakers = [{"start": 0.0, "end": 3.0, "speaker": "A"}, {"start": 3.0, "end": 6.0, "speaker": "B"}]
     for d in both:
         d["mouth"] = 1.0 if (d["track_id"] == 1) == (d["t"] < 3.0) else 0.0
     plan = _plan(tmp_path, mode="face", layout="single", detections=both, speakers=speakers)
-    assert plan.metadata["cuts"] == []
+    # Not a new face track (no scene jump); the shot camera re-frames across
+    # the room with one cut at the switch instead of a long pan.
+    cam = plan.metadata["camera"]
+    assert cam["mode"] == "shot" and cam["moves"] == 0 and len(cam["snaps"]) == 1
+    assert 2.75 <= cam["snaps"][0] <= 3.6
+    # The legacy tracker still pans when asked for.
+    legacy = _plan(tmp_path / "f", mode="face", layout="single", detections=both, speakers=speakers, camera="follow")
+    assert legacy.metadata["cuts"] == []
