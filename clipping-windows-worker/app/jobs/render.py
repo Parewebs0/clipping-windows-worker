@@ -50,7 +50,7 @@ from app.tools.captions import caption_search_window, write_ass
 from app.tools.enhance import enhance_decision, parse_enhance, run_enhance
 from app.tools.ffmpeg import FFmpegTool
 from app.tools.ffprobe import FFprobeTool
-from app.tools.reframe import ReframePlan, needs_source_size, output_size, plan_reframe
+from app.tools.reframe import ReframePlan, inset_for_campaign, needs_source_size, output_size, plan_reframe
 from app.tools.speech_cleanup import (
     cleanup_options,
     keep_ranges,
@@ -144,7 +144,9 @@ class RenderJob(BaseJob):
         # watermark{enabled, file | url, position, width, start, end}
         # on_screen_text{enabled, items[{text, start, end, position}]}
         # audio{original_only, normalize, target_lufs, true_peak_db}
-        # reframe{mode, layout, smoothing, sample_fps, speakers}
+        # reframe{mode, layout, smoothing, sample_fps, speakers, camera, inset}
+        #   layout=inset: pantalla arriba + webcam abajo por plano (campaña 58);
+        #   también se activa por REFRAME_INSET_CAMPAIGNS.
         #   mode=center + layout=single (o ausente) = crop centrado histórico.
         # cleanup{fillers, max_pause_ms, bad_takes, filler_list}
         #   Off by default. A planner or concat error falls back to one trim.
@@ -336,6 +338,7 @@ class RenderJob(BaseJob):
         applied["audio"] = audio_meta
 
         reframe_cfg = payload.get("reframe") if isinstance(payload.get("reframe"), dict) else {}
+        reframe_cfg = inset_for_campaign(reframe_cfg, payload.get("campaign_id"), self.settings.reframe_inset_campaigns)
         if not reframe_cfg.get("speakers"):
             reframe_cfg = dict(reframe_cfg)
             speakers = []
