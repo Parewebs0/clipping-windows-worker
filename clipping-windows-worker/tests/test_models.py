@@ -77,3 +77,11 @@ def test_qa_result() -> None:
     )
     assert result.status == "PASS"
     assert result.checks[0].name == "duration"
+
+
+def test_job_accepts_publish_priority_above_10() -> None:
+    # The API queues publish at 10 and once shipped 20; a priority above the
+    # old le=10 crashed the worker loop and left jobs stuck in "assigned".
+    for p in (10, 11, 20, 100):
+        job = Job.model_validate({"id": "j", "type": "publish", "priority": p})
+        assert job.priority == p

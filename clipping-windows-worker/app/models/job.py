@@ -27,7 +27,7 @@ class Job(BaseModel):
     id: str
     type: str
     status: str = JobStatus.PENDING.value
-    priority: int = Field(default=5, ge=0, le=10)
+    priority: int = Field(default=5, ge=0, le=100)  # API publish jobs use 10; headroom so a bump never crashes the loop
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: str | None = None
 
