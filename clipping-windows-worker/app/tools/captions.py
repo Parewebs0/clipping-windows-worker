@@ -661,10 +661,12 @@ def _place_emojis(cues: Any, lines: list[dict[str, Any]], duration: float) -> li
     return placed
 
 
-def _entrance_tag(width: int, height: int, position: str) -> str:
+def _entrance_tag(width: int, height: int, position: str, top_margin: int | None = None) -> str:
     anchor = _POS_ALIGN.get(position, 8)
     x = width // 2
-    if anchor == 8:
+    if anchor == 8 and top_margin is not None:
+        y_to = int(top_margin)
+    elif anchor == 8:
         y_to = int(height * 0.10)
     elif anchor == 2:
         y_to = int(height * 0.78)
@@ -691,7 +693,7 @@ def _ass_colour(value: Any, default: str) -> str:
 def _header(*, width: int, height: int, font: str, size: int, primary: str, secondary: str,
             outline: int, shadow: int, bold: int, align: int, margin_v: int, ost_size: int,
             outline_colour: str = "&H00000000", overlay_primary: str = "&H00FFFFFF",
-            margin_lr: int = 60, wrap_style: int = 0) -> str:
+            margin_lr: int = 60, wrap_style: int = 0, ost_margin_v: int | None = None) -> str:
     return (
         "[Script Info]\nScriptType: v4.00+\n"
         f"PlayResX: {width}\nPlayResY: {height}\nWrapStyle: {wrap_style}\nScaledBorderAndShadow: yes\n\n"
@@ -702,7 +704,7 @@ def _header(*, width: int, height: int, font: str, size: int, primary: str, seco
         f"Style: Caption,{font},{size},{primary},{secondary},{outline_colour},&H64000000,{bold},0,0,0,100,100,0,0,1,{outline},{shadow},"
         f"{align},{margin_lr},{margin_lr},{margin_v},1\n"
         f"Style: Overlay,{font},{ost_size},{overlay_primary},{overlay_primary},{outline_colour},&HA0000000,-1,0,0,0,100,100,0,0,3,4,0,"
-        f"8,60,60,{round(height * 0.12)},1\n\n"
+        f"8,60,60,{round(height * 0.12) if ost_margin_v is None else int(ost_margin_v)},1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
@@ -724,7 +726,7 @@ def _overlay_lines(ost: dict[str, Any], *, duration: float, width: int, height: 
         position = it.get("position", "top")
         align = _POS_ALIGN.get(position, 8)
         if it.get("entrance"):
-            prefix = _entrance_tag(width, height, position)
+            prefix = _entrance_tag(width, height, position, (ost.get("style") or {}).get("margin_v"))
         else:
             prefix = f"{{\\an{align}}}"
         lines.append(f"Dialogue: 1,{_ts(a)},{_ts(b)},Overlay,,0,0,0,,{prefix}{_esc(t)}")
@@ -836,6 +838,7 @@ def build_ass(*, width: int, height: int, captions: dict[str, Any] | None, on_sc
         align=cap_align, margin_v=cap_margin_v, ost_size=ost_size,
         outline_colour=outline_c, overlay_primary=overlay_primary,
         margin_lr=margin_lr, wrap_style=2 if single_line else 0,
+        ost_margin_v=(ost.get("style") or {}).get("margin_v"),
     )
     summary: dict[str, Any] = {
         "captions": {"applied": False, "events": 0, "preset": visual["name"]},

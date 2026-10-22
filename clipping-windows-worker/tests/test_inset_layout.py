@@ -201,11 +201,88 @@ def test_render_job_with_campaign_flag_and_captions(tmp_path, monkeypatch):
     assert result["applied"]["captions"]["applied"] is True
     out = Path(result["file_path"])
     geo = meta["inset"]["geometry"]
-    _x, cam_y, _w, cam_h = geo["cam"]
+    cam_x, cam_y, _w, cam_h = geo["cam"]
     # Inset shot: the enlarged webcam (bright room) sits right under the screen band.
-    r, g, b = _pixel(out, 1.0, 1000, cam_y + 20)
+    r, g, b = _pixel(out, 1.0, cam_x + 20, cam_y + 20)
     assert r > 150 and g > 150 and b > 150
+    # Captions moved to the zone under the webcam (never over the face or the chart).
+    zones = meta["inset"]["text_zones"]
+    assert zones["applied"] and zones["caption_margin_v"] >= cam_y + cam_h
+    ass = (out.parent / "overlay.ass").read_text()
+    caption_style = next(line for line in ass.splitlines() if line.startswith("Style: Caption"))
+    assert caption_style.split(",")[-5] == "8" and caption_style.split(",")[-2] == str(zones["caption_margin_v"])
     # Plain shot after the cut: the centre crop (grey) fills the frame.
     r, g, b = _pixel(out, 3.0, 540, 300)
     assert abs(r - 128) < 25 and abs(g - 128) < 25
     json.dumps(meta)  # metadata stays JSON-serialisable for the API
+
+
+def test_content_box_finds_the_window_inside_a_decorative_frame():
+    frames = [_frame() for _ in range(3)]
+    box = il.content_box(frames, exclude=il.Box(*WIN))
+    assert box is not None
+    x, y, w, h = box.as_list()
+    assert 200 <= x <= 215 and 100 <= y <= 115          # inside the chart window border, not on a grid line
+    assert 1685 <= x + w <= 1700 and 805 <= y + h <= 820
+
+
+def test_content_box_trims_letterbox_and_keeps_plain_frames():
+    img = np.zeros((H, W, 3), np.uint8)
+    rng = np.random.default_rng(1)
+    img[140:940] = rng.integers(0, 255, (800, W, 3), dtype=np.uint8)   # letterboxed busy content
+    box = il.content_box([img])
+    assert box is not None and 140 <= box.as_list()[1] <= 150 and 780 <= box.as_list()[3] <= 800
+    assert box.as_list()[0] == 0 and box.as_list()[2] == W
+    busy = rng.integers(0, 255, (H, W, 3), dtype=np.uint8)
+    assert il.content_box([busy]) is None                               # nothing to trim: whole frame
+
+
+def test_thumbnail_is_cut_or_masked():
+    band = il.Box(200, 100, 1500, 720)
+    small = il.Box(1600, 700, 100, 120)                                 # cheap to cut: right side
+    cut, mask, how = il.band_and_mask(band, small, W)
+    assert how == "cut_right" and mask is None and cut.x + cut.w <= 1600
+    big = il.Box(1447, 752, 395, 219)                                   # cutting loses too much: mask
+    same, mask, how = il.band_and_mask(band, big, W)
+    assert how == "mask" and same == band and mask.x < 1447 and mask.y < 752
+    assert il.band_and_mask(band, il.Box(1750, 900, 100, 100), W)[2] == "none"
+
+
+def test_geometry_v2_zones_and_upscale_cap():
+    cam = il.Box(2894, 1504, 790, 438)
+    geo = il.geometry(3840, 2160, cam, band=il.Box(430, 318, 2972, 1406), mask=il.Box(2860, 1470, 542, 254),
+                      fill="101010")
+    _x, sy, sw, sh = geo["screen"]
+    cx, cam_y, camw, camh = geo["cam"]
+    z = geo["text_zones"]
+    assert sw == 1080 and sh < 608                       # cropped band at full width
+    assert z["top"][1] == sy and sy >= il.TOP_TEXT and cam_y >= sy + sh
+    assert z["caption"][0] == cam_y + camh and 1920 - z["caption"][0] >= il.CAPTION_ZONE
+    assert geo["upscale"] <= il.CAM_UPSCALE_MAX + 1e-6 and geo["sharpen"]
+    assert geo["mask"] == [2860 - 430, 1470 - 318, 542, 1724 - 1470]
+    graph = il.build_graph([{"start": 0, "end": 5, "layout": "inset"}], geo, 3840, 2160)
+    assert "crop=2972:1406:430:318,drawbox=" in graph and "color=0x101010" in graph and "unsharp" in graph
+    small = il.geometry(1920, 1080, il.Box(*WIN))        # 1080p source: the webcam is not blown up 2.9x
+    assert small["upscale"] <= il.CAM_UPSCALE_MAX + 1e-6 and small["cam"][2] < 1080
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_probe_aborts_early_without_a_window(tmp_path, monkeypatch):
+    stub = MagicMock(return_value=[])
+    monkeypatch.setattr(rf, "_inset_detector", lambda model_dir: stub)
+    src = _source(tmp_path)
+    plan = plan_reframe(input_path=src, start=0.0, end=4.0, output_format="9:16", reframe={"layout": "inset"},
+                        src_w=W, src_h=H, output_fps=30.0, work_dir=tmp_path)
+    meta = plan.metadata
+    assert plan.legacy is True and meta["fallback"] == "no_inset"
+    assert meta["inset"]["probe"]["hits"] == 0 and "scene_cuts_s" not in meta["timings"]
+    assert stub.call_count <= il.PROBES * 4              # quadrants of the probe frames only
+
+
+def test_overlay_margin_override():
+    from app.tools.captions import build_ass
+    ost = {"enabled": True, "style": {"margin_v": 77},
+           "items": [{"text": "Sell at high of day", "start": 0, "end": 2, "position": "top", "entrance": True}]}
+    ass, _ = build_ass(width=1080, height=1920, captions=None, on_screen_text=ost, duration=4.0)
+    overlay = next(line for line in ass.splitlines() if line.startswith("Style: Overlay"))
+    assert overlay.split(",")[-2] == "77" and ",77,0,280)" in ass
